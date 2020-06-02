@@ -1,0 +1,2346 @@
+% !TEX program = xelatex
+% !TEX pweaveOutputFormat = tex
+% cSpell: disable
+
+%\documentclass[justified]{tufte-handout}
+\documentclass{article}
+\usepackage{arxiv}
+%\linespread{1.25}
+\renewcommand{\arraystretch}{1.25}
+
+%\renewcommand{\smallcaps}[1]{\sffamily #1}
+\usepackage{multirow}
+\usepackage{amssymb,mathtools}
+\usepackage{booktabs}
+%
+\usepackage{hyperref}
+\hypersetup
+{ pdfauthor = {Gyan Sinha},
+  pdftitle={Loan Payment Deferrals Due to COVID-19: A Case Study},
+  colorlinks=TRUE,
+  linkcolor=black,
+  citecolor=blue,
+  urlcolor=blue
+}
+%
+\RequirePackage{fontspec}
+%\defaultfontfeatures{Mapping=tex-text,Scale=MatchLowercase}
+\setmainfont{Source Sans Pro}
+% \setsansfont[BoldFont={Source Sans Pro Bold}]{Source Sans Pro}
+%\setmainfont{Roboto Condensed}
+%\setsansfont[BoldFont={Roboto Condensed Bold}]{Roboto Condensed}
+%
+\usepackage{graphicx}
+\graphicspath{/home/gsinha/admin/docs/logos}
+
+<<imports, echo=False>>=
+import warnings
+warnings.filterwarnings("ignore")
+import sys
+import datetime
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import seaborn as sns
+sns.set()
+
+plt.rcParams.update({
+    "font.family": "Source Sans Pro",
+    "font.serif": ["Source Sans Pro"], 
+    "font.sans-serif": ["Source Sans Pro"],
+    "font.size": 10,
+})
+
+import joblib
+import numpy as np
+import pandas as pd
+
+import feather
+
+import pymc3 as pm
+import arviz as az
+
+import lifelines
+from lifelines import KaplanMeierFitter, NelsonAalenFitter
+from scipy.special import expit
+
+from analytics import utils
+
+files_dir = "/home/gsinha/admin/db/dev/Python/projects/scripts/misc/"
+sys.path.append(files_dir)
+import common
+
+omap = {"LC": "I", "PR": "II"}
+
+# read in total percentiles
+with open(files_dir + 'defer_stats.pkl', 'rb') as f:
+  defer_stats_dict = joblib.load(f)
+
+deferments_itd = defer_stats_dict["actual"]
+tot_pctile = defer_stats_dict["projections"]
+@
+
+
+\title{Loan Payment Deferrals Due to COVID-19: A Case Study}
+\author{Gyan Sinha, Godolphin Capital Management, LLC%
+\thanks{\scriptsize \emph{%Godolphin Capital Management, LLC,%
+\href{mailto:gsinha@godolphincapital.com}{Email Gyan}. This report
+has been prepared by Godolphin Capital Management, LLC
+(``Godolphin'') and is provided for informational purposes only and
+does not constitute an offer to sell or a solicitation to purchase
+any security. The contents of this research report are not intended
+to provide investment advice and under no circumstances does this
+research report represent a recommendation to buy or sell a security.
+The information contained herein reflects the opinions of Godolphin.
+Such opinions are based on information received by Godolphin from
+independent sources. While Godolphin believes that the information
+provided to it by its sources is accurate, Godolphin has not independently
+verified such information and does not vouch for its accuracy. Neither
+the author, nor Godolphin has undertaken any responsibility to update
+any portion of this research report in response to events which may
+transpire subsequent to its original publication date. As such, there
+can be no guarantee that the information contained herein continues
+to be accurate or timely or that Godolphin continues to hold the views
+contained herein. Godolphin is an investment adviser. Investments
+made by Godolphin are made in the context of various factors including
+investment parameters and restrictions. As such, there may not be
+a direct correlation between the views expressed in this article and
+Godolphin's trading on behalf of its clients. 
+<%print(f'Version:{datetime.datetime.now()}') %>}}
+}
+
+\date{\today}
+%{\includegraphics[width=.25\textwidth]{GodolphinLogo.jpg}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+
+This report analyzes payment deferments or forebearance as a result of
+COVID-19 related shutdowns in the US. We focus on a
+portfolio of unsecured consumer loans originated by 2 different
+institutions. Our analysis focuses on a few key questions:
+\begin{itemize}
+\item what is the magnitude of COVID related deferments so far?
+\item can we estimate deferment probabilities and quantify
+  uncertainty bounds around it?
+\item does geography impact deferment rates?
+\item are there systematic relationships across loans that explain
+  deferment requests?
+\item can regional labor market trends explain the probability
+  of loan deferment? 
+\item does the sensitivity to labor market shocks vary by region?
+\item can we leverage this data to generate longer-term, steady-state 
+  deferment rates based on assumptions about the future path of labor 
+  markets?
+\end{itemize}
+
+The results presented here are intended to provide a basis for discussion 
+about these questions within a general framework that can
+be applied not only to unsecured consumer loans but also more broadly,
+to other lending sectors. While the data are still  preliminary and the 
+events they capture very recent, our conclusions are based on a rigorous and 
+transparent statistical analysis and are presented with confidence 
+bounds that respect the uncertainty we are currently living through.
+
+In summarizing our results, we would say that larger loans are at greater risk of 
+deferment while higher incomes and more seasoning (the age of the loan) tend 
+to reduce the chance of a deferment. Borrowers who rent and are self-employed
+are at higher risk of deferment. Loans with 5-year amortization terms are
+riskier than those with 3-year terms. All else held equal, the impact of FICO scores
+and DTI ratios is ambiguous ---  in one case, they tend to decrease the risk while 
+in the other they tend to raise it, albeit by small amounts. On average, 
+a 1 standard-deviation increase in a state's weekly claims (as a percentage of 
+the labor force) implies a roughly 12\% increase in deferment probabilities, 
+although this parameter exhibits substantial variation across states.
+\textbf{Given the current level of deferments (approximately 
+<%print(f'{100*deferments_itd:.2f}')%>\%) and 
+their recent weekly pace (about 30 bps per week, down from a peak of 3\%
+to 4\% per week in March), we expect deferments to reach 
+<%print(f'{100*tot_pctile[2]:.2f}')%>\% (95\% 
+credible interval: [<%print(f'{100*tot_pctile[0]:.2f}')%>\%, 
+<%print(f'{100*tot_pctile[4]:.2f}')%>\%]) by the 
+end of the second quarter.} These forecasts assume cumulative claims of 
+approximately 45 million by the end of the second quarter, from their peak on
+April 4th, 2020. While the ultimate impact on valuation will depend on cure rates
+from deferment, the estimates presented here establish quasi-lower bounds on 
+loan values.  \textbf{
+  In rough numbers, the current deferment run rate of 
+30 bps per week, with no cures at deferment expiration, would imply 
+additional annualized default rates (in CDR terms) of 
+<%print(f'{100 * (1-(1-1-(1-0.0030)**4)**12):.2f}')%>\%.}
+
+\end{abstract}
+
+<<model_dicts, echo=False>>=
+hier_dict = {}
+data_scaler_dict = {}
+risk_scaler_dict = {}
+
+data_dict = {}
+hard_dict = {}
+risk_dict = {}
+
+X_dict = {}
+X_risk_dict = {}
+
+asof_date_dict = {}
+ic_date_dict = {}
+
+cat_vars_dict = {}
+cat_var_names_dict = {}
+n_draws_dict = {}
+
+one_hot_enc_dict = {}
+formula_dict = {}
+
+for i in [omap["LC"], omap["PR"]]:
+  fname = files_dir + "hierarchical_r_" + i + ".pkl"
+  with open(fname, "rb") as f:
+    hier_dict[i] = joblib.load(f)
+
+    data_scaler_dict[i] = hier_dict[i]["data_scaler"]
+    risk_scaler_dict[i] = hier_dict[i]["risk_scaler"]
+    data_dict[i] = hier_dict[i]["data_df"]
+    hard_dict[i] = hier_dict[i]["hard_df"]
+    risk_dict[i] = hier_dict[i]["risk_df"]
+    X_dict[i] = hier_dict[i]["X"]
+    X_risk_dict[i] = hier_dict[i]["X_risk"]
+
+    # PARAMS
+    asof_date_dict[i] =  hier_dict[i]["asof_date"]
+    ic_date_dict[i] =  hier_dict[i]["ic_date"]
+
+    cat_vars_dict[i] = hier_dict[i]["cat_vars"]
+    cat_var_names_dict[i] = hier_dict[i]["cat_var_names"]
+
+    n_draws_dict[i] = hier_dict[i]["n_draws"]
+
+    one_hot_enc_dict[i] = hier_dict[i]["one_hot_enc"]
+    formula_dict[i] = hier_dict[i]["formula"]
+
+with open(files_dir + "risk_df.feather", "rb") as f:
+  risk_df = feather.read_dataframe(f)
+
+asof_date = asof_date_dict[omap["LC"]]
+@
+
+<<pymc_funcs, echo=False>>=
+
+def make_az_data(originator, pymc_dict):
+  ''' make az data instance for originator '''
+
+  hier_model = pymc_dict[originator]["model"]
+  hier_trace = pymc_dict[originator]["trace"]
+  data_df = pymc_dict[originator]["data_df"]
+  
+  risk_df = pymc_dict[originator]["risk_df"]
+  states = list(risk_df["state"].unique())
+  states.sort()
+
+  X = pymc_dict[originator]["X"]
+
+  with hier_model:
+    posterior_predictive = pm.sample_posterior_predictive(
+      hier_trace, progressbar=False
+    )
+
+  weeks = ["a_" + str(x) for x in data_df.start.unique()]
+  az_data = az.from_pymc3(
+      trace=hier_trace,
+      posterior_predictive=posterior_predictive,
+      model=hier_model,
+      coords={
+        'covars': X.columns.to_list(),
+        'states': states,
+        'weeks': weeks
+      },
+      dims={'a': ["weeks"], 'b': ['covars'], "γ": ["states"]}
+  ) 
+
+  return az_data, hier_model, hier_trace, posterior_predictive
+@
+
+<<datasets, echo=False>>=
+# just need one issuer for the combined data
+hard_df = hard_dict[omap["LC"]]
+@
+
+\section{Introduction}
+
+Our reasons for undertaking this research project were driven by
+practical considerations --- like many other investors in consumer and
+mortgage lending, we happen to be long these loans. As such, it is
+critical for us to evaluate future losses and prospective returns on
+these loans and make assessments about their ``fundamental'' value.
+We do this with the explicit recognition of the unprecedented nature
+of the COVID shock and the fact that in many ways, we are sailing
+through uncharted waters.
+
+A natural question that may arise here is the applicability of the analysis
+presented given its narrow focus. While there is a natural
+tendency to always seek out more and greater amounts of data, in
+practice, investors in most cases, hold narrow subsets of the overall population of
+loans. While larger datasets may give us more precise estimates (up to
+a point), the fact is that we want to make statements about OUR
+portfolio, not a fictional universe which is not owned by anyone in
+particular. The challenge then is to employ statistical methods that
+allow us to extract information from ``small'' not ``big'' data and
+turn these into useful insights for decision-making. This is where the
+bayesian methods we deploy in this report come in useful since they
+explicitly deal with inferential uncertainty in an intrinsic way and
+can be used to provide insights in other contexts as well.
+
+There are 3 parts to our project. First, we tackle the analysis by
+describing the data set in some detail and present
+stratifications of the data by different loan attributes. We also
+present the deferment rates within each strata in order to get
+intuition around the impact of loan attributes. We then
+provide statistics around the labor markets in various states. We look
+at the impact of initial claims, starting March 14th (which we peg as
+the start of the COVID crisis for our purposes) and through the week
+ending %
+<%print(f'{ic_date_dict[omap["LC"]].strftime("%B %-d, %Y")}')%>, as a percent
+of the total employment in each state at the beginning of March. 
+An open question that the modeling seeks to answer is the impact of the
+claims variables on deferment rates and whether these can be leveraged into a 
+prediction framework going forward. A discussion of the statistical model 
+that relates the observed outcome (did the loan defer: Yes/No?) to the 
+various loan attributes is provided next. The framework employed is based on 
+Survival Analysis, using a hierarchical bayes approach as
+in~\cite{8328358dab6746d884ee538c687aa0dd}
+and~\cite{doi:10.1198/004017005000000661}. In closing this part, we
+present and discuss the results across the two institutions,
+highlighting any differences in the impact of attributes that emerge.
+
+In the second part of our work, we develop a methodology for
+forecasting the path of initial claims at the national and state
+levels over the next few months. This analysis is unique in its own
+way and leverages a brief descriptive note put out by Federal Reserve
+Bank of NY researchers in a blog article. We use the claims forecast
+as inputs into the predictions for deferment rates at the end of
+second quarter of 2020, which is our forecast horizon.
+
+The third part of the project applies the deferment forecasts
+developed in the first and second parts to predict deferment
+rates at the end of the second quarter. The methodology is 
+simple --- we take as given the set of loans that are already
+in deferment and project the share of loans that are likely
+to be in deferment roughly 8 weeks out. The combined total
+gives us the answer we are looking for.
+
+Before we dive into the details, there are 3 key technical aspects in
+this report that are worth highlighting.  First, the use of survival or
+hazard models to estimate the marginal deferment probability, as a
+function of weeks elapsed since the crisis is key to sensible
+projections of deferment \footnote{This is a benefit over and above
+the intrinsic gain from using this framework in the context of 
+``censored'' data where most of the observations have not yet 
+experienced a deferment event}. As we show, these marginal
+hazards have a very strong ``duration'' component which impacts
+longer-term forecasts of the cumulative amount of deferments we expect
+over the next few months. 
+
+Second, we extend the survival model
+framework by incorporating parameter hierarchies (within a bayesian
+framework) that explicitly account for random variation in the impact
+of variables, across state clusters. This allows for the 
+possibility of ``unobserved heterogeneity'' in the data by
+explicitly modeling a state-specific random variable that interacts
+with and modifies the hazards for loan clusters within a state. This 
+is an important enhancement since (i) there may be
+differences in the composition of the workforce across states that
+affects the way in which a given volume of claims affects deferment
+rates, and (ii) the borrower base itself may differ across states in both
+observable and unobservable ways. We control for the observed
+attributes explicitly but the hierarchical framework allows us to
+model unobserved factors as well. 
+
+Third, we develop a statistical framework 
+to model ``decay'' rates for weekly claims and the role that labor markets 
+play in determining deferment rates, building upon ideas first discussed 
+by researchers at the NY Fed. The projections from this framework serve as 
+inputs to our longer-term deferment forecasts and allows us to model the 
+impact of different economic scenarios in the future, an important tool to have
+in the arsenal given the considerable uncertainties that still remain
+regarding the future path of the economy.
+
+\section{Data}
+In Table~\ref{tbl:portfolio_summary}, we provided an overview of our 
+data sample. In all, we have <%print(f'{hard_df.shape[0]}')%> loans
+in our data, in roughly a 50/50 split (by count) across the 2 institutions.
+
+\begin{table}[ht]
+\centering
+\caption{Portfolio Summary}
+\label{tbl:portfolio_summary}
+\scalebox{0.90}{
+<<portfolio_summary, echo=False, results="tex">>=
+
+hard_df["current_balance"] = (
+  hard_df["original_balance"] * hard_df["cur_note_amount"]/hard_df["note_amount"]
+)
+hard_df["defer_dollar"] = hard_df["defer"] * hard_df["current_balance"]
+
+def wavg(x):
+    return np.average(
+        x, weights=hard_df.loc[x.index, "current_balance"]
+    )
+
+aaa = hard_df.groupby(["originator", "grade"]).agg(
+    n=('loan_id', "count"),
+    original_balance=('original_balance', sum),
+    current_balance=('current_balance', sum),
+    wac=('original_rate', wavg),
+    age=('age', wavg),
+    fico=('fico', wavg),
+    term=('original_term', wavg),
+    defer=('defer', wavg),
+)
+
+bbb = hard_df.groupby(["originator"]).agg(
+    n=('loan_id', "count"),
+    original_balance=('original_balance', sum),
+    current_balance=('current_balance', sum),
+    wac=('original_rate', wavg),
+    age=('age', wavg),
+    fico=('fico', wavg),
+    term=('original_term', wavg),
+    defer=('defer', wavg),
+)
+
+bbb.index = pd.MultiIndex.from_tuples(
+    [(omap["LC"], 'ALL'), (omap["PR"], 'ALL')], names=['originator', 'grade']
+)
+
+aaa = pd.concat([aaa, bbb])
+
+ccc = pd.concat(
+    [
+        pd.Series(hard_df["loan_id"].apply("count"), name="n"),
+        pd.Series(hard_df["original_balance"].sum(), name="original_balance"),
+        pd.Series(hard_df["current_balance"].sum(), name="current_balance"),
+        hard_df[["original_rate", "age", "fico", "original_term"]].apply(wavg).to_frame().T.rename(
+            columns={"original_term": "term", "original_rate": "wac"}),
+        pd.Series(wavg(hard_df["defer"]), name="defer"),
+    ], axis=1
+)
+ccc.index = [('ALL', 'ALL')]
+
+ddd = pd.concat([aaa, ccc])
+ddd["pct"] = ddd["current_balance"]/ddd.loc[pd.IndexSlice["ALL", "ALL"],  "current_balance"]
+ddd.index.names = ["Originator", "Grade"]
+
+cfmt = "".join(["r"] * (ddd.shape[1] + 2))
+header = [
+  "N", "Orig. Bal.", "Cur. Bal.", "WAC", "WALA", "FICO", 
+  "WAOT", "Defer", "Share",
+]
+tbl_fmt = {
+  "original_balance": utils.dollar,
+  "current_balance": utils.dollar,
+  "n": utils.integer, "fico": utils.number,
+  "term": utils.number, "age": utils.number,
+  "pct": utils.percent, "defer": utils.percent,
+  "wac": utils.percent
+}
+
+print(
+    ddd.to_latex(
+      index=True, multirow=True, 
+      header=header,
+      
+      formatters=tbl_fmt,
+      column_format=cfmt,
+      multicolumn_format="r",
+    ))
+
+one_line = ddd.loc[pd.IndexSlice["ALL", :], :]
+@
+}
+\end{table}
+
+The aggregate original amount issued is \$%
+<%print(f'{float(one_line.original_balance):,.2f}')%>,
+with a weighted-average interest rate of
+<%print(f'{utils.number(100*float(one_line.wac))}')%>\%,
+a weighted-average FICO score of %
+<%print(f'{utils.number(float(one_line.fico))}')%> and
+is <%print(f'{utils.number(float(one_line.age))}')%>
+months seasoned. The weighted-average original-term %
+is <%print(f'{utils.number(float(one_line.term))}')%> months.
+\textbf{Overall, the deferment rate on this portfolio is %
+<%print(f'{100*float(one_line.defer):.2f}')%>\%.}
+
+The portfolio statistics presented here are as of
+<%print(f'{asof_date_dict[omap["LC"]].strftime("%B %-d, %Y")}')%> which is roughly one 
+month into the onset of the significant ''shelter-at-home'' orders
+across the country and resulting economic disruptions. Since 
+most of these payment deferrals are for anywhere from 1 to 
+3 months, the deferment percentages can be viewed as the
+cumulative share of loans deferred since the start of the
+COVID crisis.
+
+By way of comparison, we provide recent deferment figures for other 
+related sectors such as mortgages. Approximately 7.6\% of all mortgage loans
+were in forebearance as of April 26th, 2020 which is a roughly
+<%print(f'{(pd.to_datetime(asof_date_dict[omap["LC"]]) - pd.to_datetime("2020-04-26")).days}') %>
+days earlier than the cutoff date for our data set. In the Ginnie Mae
+sector, 10.5\% of loans were in forebearance while the comparable
+figure for conventional mortgages was 5.9\%.
+
+In figure~\ref{fig:due_day_dist}, we present the frequency 
+distribution of the payment dates on the loans in our sample.
+Since borrowers may have a tendency to hold off
+on requesting a deferral until they are close to or past their
+due day, and given the relatively short data window, this may
+lead to biases. A relatively uniform distribution of payment
+due dates would serve to assuage this concern. Thankfully,
+this is exactly what we find in the data presented here,
+eliminating this aspect of the data as a potential source
+of concern.
+
+\begin{figure}
+\caption{Distribution of due dates}
+\label{fig:due_day_dist}
+\scalebox{1}{
+<<due_day_dist, echo=False>>=
+pos = []
+for i in [omap["LC"], omap["PR"]]:
+    pos.append(common.get_due_day(i, asof_date_dict[i]))
+pos_df = pd.concat(pos, ignore_index=True)
+pos_df = pos_df[pos_df["loan_id"].isin(hard_df["loan_id"].to_list())]
+
+fig, ax = plt.subplots(2, 1, figsize=(10, 5), sharey=True)
+for i, v in enumerate([omap["LC"], omap["PR"]]):
+    df = pos_df[pos_df["originator"] == v]
+    ax[i].hist(df.pmt_day)
+    ax[i].set_xlabel("Due day")
+    ax[i].set_ylabel("Frequency")
+    ax[i].set_title(f"Originator: {v}")
+    
+plt.tight_layout()
+@
+}
+\end{figure}
+
+In Table~\ref{tbl:port_summary_purpose}, we provide a stratification of 
+the portfolio by loan purpose. More than two-thirds of the loans are used for
+consolidating existing debt, mostly drawn on credit cards. The second 
+largest category is for purchases, while less than 10\% is used for 
+expenses such as for a wedding etc. (``LifeCyle'').
+
+\begin{table}[ht]
+\centering
+\caption{Portfolio summary, by purpose}
+\label{tbl:port_summary_purpose}
+\scalebox{0.80}{
+<<port_summary_purpose, echo=False, results="tex">>=
+purpose_tbl = common.summary_by_group(
+    ["originator", "purpose"], hard_df
+)
+purpose_tbl.index.names = ["Originator", "Purpose"]
+cfmt = "".join(["r"] * (purpose_tbl.shape[1] + 2))
+
+print(
+    purpose_tbl.to_latex(
+      index=True, multirow=True, 
+      header=header,
+      
+      formatters=tbl_fmt,
+      column_format=cfmt,
+      multicolumn_format="r",
+    ))
+@
+}
+\end{table}
+
+In Table~\ref{tbl:port_summary_emp_status}, a stratification across 
+the borrower's employment status is provided. The ``Self-employed''
+and ``Other'' categories generally comprise anywhere from 10\% to 15\%
+of the portfolio\footnote{In the case of Originator I, the employment
+category is really a dummy variable for the presence or absence
+of employment history --- if there is information on this count,
+this field is coded as ``Employed'' otherwise it is coded as 
+``Other''}.
+
+\begin{table}[ht]
+\centering
+\caption{Portfolio summary, by employment status}
+\label{tbl:port_summary_emp_status}
+\scalebox{0.85}{
+<<port_summary_emp_status, echo=False, results="tex">>=
+emp_tbl = common.summary_by_group(
+    ["originator", "employment_status"], hard_df
+)
+emp_tbl = emp_tbl.fillna(0)
+emp_tbl.index.names = ["Originator", "Employment"]
+cfmt = "".join(["r"] * (emp_tbl.shape[1] + 2))
+print(
+    emp_tbl.to_latex(
+      index=True, multirow=True, 
+      header=header,
+      
+      formatters=tbl_fmt,
+      column_format=cfmt,
+      multicolumn_format="r",
+    ))
+@
+}
+\end{table}
+
+In Table~\ref{tbl:port_summary_homeowner}, the portfolio is stratified 
+across housing tenure. Across the 2 institutions, roughly a quarter to
+two-thirds of the borrowing is by renters.
+
+\begin{table}[ht]
+\centering
+\caption{Portfolio summary, by homeownership}
+\label{tbl:port_summary_homeowner}
+\scalebox{0.85}{
+<<port_summary_homeowner, echo=False, results="tex">>=
+homeowner_tbl = common.summary_by_group(
+    ["originator", "home_ownership"], hard_df
+)
+homeowner_tbl.index.names = ["Originator", "Homeownership"]
+cfmt = "".join(["r"] * (homeowner_tbl.shape[1] + 2))
+print(
+    homeowner_tbl.to_latex(
+      index=True, multirow=True, 
+      header=header,
+      
+      formatters=tbl_fmt,
+      column_format=cfmt,
+      multicolumn_format="r",
+    ))
+@
+}
+\end{table}
+
+Finally, in Table~\ref{tbl:port_summary_term}, we stratify by
+loan term. Across the 2 institutions, roughly 50\% - 70\% of
+the loans are 3-year amortization terms, with the remainder
+for a 5-year term.
+
+\begin{table}[ht]
+\centering
+\caption{Portfolio summary, by term}
+\label{tbl:port_summary_term}
+\scalebox{0.90}{
+<<port_summary_term, echo=False, results="tex">>=
+term_tbl = common.summary_by_group(
+    ["originator", "original_term"], hard_df
+)
+term_tbl.index.names = ["Originator", "Term"]
+cfmt = "".join(["r"] * (term_tbl.shape[1] + 2))
+print(
+    term_tbl.to_latex(
+      index=True, multirow=True, 
+      header=header,
+      
+      formatters=tbl_fmt,
+      column_format=cfmt,
+      multicolumn_format="r",
+    ))
+@
+}
+\end{table}
+
+An important question, with possible implications about the
+prospective cure rates for the group of deferment loans, is 
+what they look like versus the subset of loans that were already
+delinquent before the crisis. This is presented in 
+Table~\ref{tbl:pre_covid_dq_profile}.
+
+\begin{table}[ht]
+\centering
+\caption{DQ \emph{vs} COVID profile}
+\label{tbl:pre_covid_dq_profile}
+\scalebox{0.90}{
+<<pre_covid_dq_profile, echo=False, results="tex">>=
+dq_tbl = common.summary_by_group(
+    ["originator", "dq_grp"], hard_df
+)
+dq_tbl.index.names = ["Originator", "DQ Status"]
+cfmt = "".join(["r"] * (dq_tbl.shape[1] + 2))
+print(
+    dq_tbl.to_latex(
+      index=True, multirow=True, 
+      header=header,
+      
+      formatters=tbl_fmt,
+      column_format=cfmt,
+      multicolumn_format="r",
+    ))
+@
+}
+\end{table}
+
+The deferment subset has better credit quality (as measured)
+by their FICO scores than both ``Current'' and delinquent sub-population 
+for Originator I. This may imply that the cure rate from deferments may be
+better on the deferred sub-population than has been the experience on the 
+delinquent sub-population. In the case of Originator II, the deferment and
+delinquent sets have roughly the same FICO score which is lower
+than that on the set of loans that are ``Current''.
+
+\section{Employment}
+The economic disruption caused by COVID is in many ways unusual 
+in that it strikes at the Consumption component of overall GDP. 
+As such, the disruption is much broader than would be the case,
+say, for an investment led recession, caused by a contraction in
+an isolated segment of the economy. 
+
+In some ways, this resembles the 2008 recession which was caused by a 
+massive asset writedowns in the banking sector (on a global basis) 
+leading to an economy-wide credit crunch. To the extent that it strikes 
+at almost two-thirds of overall economic output, the disruption is naturally 
+even larger, as has become obvious in the labor market figures released over 
+the last month. Labor markets are likely to be the key to deferments, and 
+both the full magnitude of job losses and how quickly they are reversed
+is going to be the driver of ultimate loan performance.
+
+The trend in claims percentages and their distribution is presented in
+Figure~\ref{fig:claims_pct_trend}.
+
+\begin{figure}[ht]
+\caption{Claims as share of labor force}
+\label{fig:claims_pct_trend}
+\scalebox{1}{
+<<claims_pct_trend, echo=False>>=
+long_df = []
+for i in [omap["LC"], omap["PR"]]:
+  long_df.append(data_dict[i])
+long_df = pd.concat(long_df, ignore_index=True)
+
+interp_df = long_df[
+    long_df["edate"] <= (ic_date_dict[omap["LC"]] - pd.tseries.offsets.Week(1))
+].groupby(["state", "edate"])["pct_ic"].mean().reset_index()
+
+fig, ax = plt.subplots(2, 1, figsize=(8, 6.4))
+
+sns.boxplot(interp_df.edate.dt.date, interp_df.pct_ic, ax=ax[0])
+sns.distplot(interp_df.pct_ic, ax=ax[1], kde=False)
+ax[0].set_xlabel(""); 
+ax[0].set_ylabel("Weekly claims/Labor Force")
+ax[1].set_xlabel("Weekly claims/Labor Force")
+ax[0].yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+ax[1].xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+plt.tight_layout()
+@
+} 
+\end{figure}
+
+\subsection{Claims}
+In Figures~\ref{fig:lc_defer_hazard_by_state} and%
+~\ref{fig:pr_defer_hazard_by_state}, we depict the 
+relationship between deferments and the claims measure.
+The solid trend line is a robust fit for the scatter plot 
+depicted here, with bootstrapped 95\% confidence intervals
+shown by the shaded areas.
+
+<<defer_hazard_by_state, echo=False>>=
+def plot_defer_hazard_by_state(originator):
+  ''' plots deferment hazards by state and week '''
+  zzz = hier_dict[originator]["data_df"].copy()
+
+  a_df = zzz.groupby(["state"]).agg(
+    n=("loan_id", "count"), k=("defer", np.sum), defer=("defer", np.mean),
+    pct_ic=("pct_ic", np.mean), pct_high_risk=('pct_high_risk', np.mean)
+  ).reset_index()
+
+  g = sns.FacetGrid(
+    data=a_df.reset_index(),
+  )
+  g.map(sns.regplot, "pct_ic", "defer", ci=True)
+  g.ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+  g.ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+
+  # add annotations one by one with a loop
+  for line in range(0, a_df.shape[0]):
+    g.ax.text(
+      a_df["pct_ic"][line]+0.001, a_df["defer"][line], a_df["state"][line], 
+      horizontalalignment='left', size='medium', color='red', 
+      weight='semibold', alpha=0.25
+    )
+
+  g.ax.figure.set_size_inches(15, 8)
+  g.ax.set_xlabel("Weekly claims/March Employment")
+  g.ax.set_ylabel("Deferment hazard")
+
+  return g
+@
+
+\begin{figure}[htb!]
+\caption{Originator I: deferment hazard}
+\label{fig:lc_defer_hazard_by_state}
+\scalebox{1}{
+<<lc_defer_hazard_by_state, echo=False>>=
+g = plot_defer_hazard_by_state(omap["LC"])
+sns.despine(left=True)
+@
+}
+\end{figure}
+
+\begin{figure}[htb!]
+\caption{Originator II: deferment hazard}
+\label{fig:pr_defer_hazard_by_state}
+\scalebox{1}{
+<<pr_defer_hazard_by_state, echo=False>>=
+g = plot_defer_hazard_by_state(omap["PR"])
+sns.despine(left=True)
+@
+}
+\end{figure}
+
+While there appears to be evidence for a positive relationship, there is 
+considerable variability around the mean. The modeling exercise will seek 
+to examine how much of this variability across states in the relationship 
+between deferments and the claims measure can be explained by individual 
+loan attributes.
+
+\section{Model}
+
+The modeling framework used in this report draws upon statistical
+tools used in the analysis of events with a ``time-until'' component
+to them. In our case, the time-until, or ``lifetime''  we are 
+interested in predicting is the time until a borrower asks the
+servicer for a deferment. Time in this context is measured from
+an assumed epoch start date of March 14th, 2020 which we assume
+as the start of the COVID-19 crisis for our purposes and is the
+same across all loans.
+
+\subsection{Pooled}
+We first describe the general setup of the model, assuming a 
+``pooled'' setup where the concept of clusters and correlation
+of outcomes for loans within clusters is initially ignored. This
+allows us to provide a basic framework which is then extended
+to the hierarchical setting. The exposition here is based on
+and closely follows the excellent series of lecture notes by 
+\cite{grodriguez}.
+
+Let the time-to-event $T$ be a continuous variable with Cumulative
+Distribution Function (CDF), $F(t)$ and density $f(t)$. $F(t)$
+defines $P(T < t)$ or the cumulative probability that the
+lifetime lasts until duration $t$. An alternative representation
+more commonly employed in the survival literature is the
+``Survival Function'' $S(t)$ which is the complement of the CDF:
+
+\begin{equation}
+S(t) = P(T >= t) = 1 - F(t) = \int_t^\infty \! f(x) \, \mathrm{d}x.
+\end{equation}
+The density function of lifetimes can be represented as $F'(t)$,
+the derivative of the CDF.
+
+An alternative characterization of the distribution of $T$
+is given by the hazard function, or instantaneous rate of
+occurrence of the event, defined as:
+\begin{equation} \label{eq:hazard}
+\lambda(t) = \lim_{\mathrm{d}t \to 0} \frac{P(t
+    \leq T < t + \mathrm{d}t| T \geq t)}{\mathrm{d}t}
+\end{equation}
+
+The numerator in equation~\ref{eq:hazard} is the conditional
+probability of an event ocurring in the interval $t, t + \mathrm{d}t)$,
+conditional on it not having occured before $t$. The denominator
+is the length of the time interval, which means the hazard
+represents a rate of ocurrence. In the limit, as
+$\mathrm{d}t$ goes to 0 --- the hazard represents the
+instanteous rate of occurence of the event.
+
+The conditional probability in the numerator may be written as the ratio
+of the joint probability that $T$ is in the interval $[t, t + \mathrm{d}t)$ and $T \geq t$ (which
+is, of course, the same as the probability that $t$ is in the interval), to the
+probability that $T \geq t$. The former may be written as $f(t)\mathrm{d}t$ for
+small $\mathrm{d}t$, while the latter is $S(t)$ by definition. Dividing by $\mathrm{d}t$ and passing
+to the limit gives the useful result:
+\begin{equation} \label{eq:haz_alt}
+\lambda(t) = \frac{f(t)}{S(t)}
+\end{equation}
+Since $-f(t)$ is the derivative of $S(t)$, equation~\ref{eq:haz_alt} can also be written as:
+\begin{equation}
+\lambda(t) = -\frac{\mathrm{d}}{\mathrm{d}t} \ln(S(t))
+\end{equation}
+Integrating from 0 to $t$ and imposing the known boundary condition $S(0) = 1$
+(since by construction, the event cannot have occurred at time 0), 
+we obtain the following expression:
+\begin{equation} \label{eq:cum_hazard}
+S(t) = \exp\left\{-\int_{0}^{t}\lambda(x)\mathrm{d}x\right\}
+\end{equation}
+
+The integration term in equation~\ref{eq:cum_hazard} is referred to as the
+\emph{cumulative hazard} and is denoted
+\begin{equation}
+\Lambda(t) = \int_{0}^{t}\lambda(x)\mathrm{d}x
+\end{equation}
+
+One can think of the cumulative hazard as the total risk of the event
+happening from the time of entry into the state to time $t$.
+
+In the simplest case, the hazard is constant over time spent in the state,
+i.e., $\lambda(t) = \lambda$ for all $t$. The corresponding survival
+function is $S(t) = \exp(-\lambda t)$ which is an exponential
+distribution with parameter $\lambda$. The density is obtained as the
+product of the hazard and the survivor function, or:
+\begin{equation}
+f(t) = \lambda \exp \left \{-\lambda t \right \}
+\end{equation}
+the mean of which is $1/\lambda$.
+
+As an aside, a few interest points are worth noting here: 
+\begin{itemize}
+    \item There is a close connection between industry practice around the modeling
+        of cash flows on loans and hazard rates. There are two operative concepts
+        here - SMM and MDR which stand for Single Monthly Mortality and
+        Monthly Default Rate respectively.
+    \item Both represent unscheduled principal
+        that is paid or written down, as a fraction of the balance outstanding.
+        In this respect, the equivalence to the hazard function is clear -
+        the unscheduled principal paid at time $t$ is the density $f(t)$ while
+        the balance still outstanding is $S(t)$.
+    \item Typically these concepts are
+        applied to groups of loans and aggregations of principal paid and
+        balance outstanding, but the analytical apparatus of hazard rates is
+        directly application at each individual loan level.
+\end{itemize}
+
+In analyzing cash flows, we are interested in events that can
+lead to a change in state and change the profile of scheduled
+cashflows. Once a loan is created, its lifetime
+(and/or its state) can change or be terminated through a multiplicity of ways.
+These events can be modeled using \textbf{cause-specific hazard functions}.
+The cause-specific hazard function for the $j$th failure type is:
+
+\begin{equation} \label{eq:cause_specific_hazard}
+\lambda_{j}(t) = \lim_{\mathrm{d}t \to 0} \frac{P(t \leq T < t +
+    \mathrm{d}t, J = j| T \geq t)}{\mathrm{d}t}
+\end{equation}
+The total hazard of leaving the state can be written as the sum of
+cause-specific hazards, $\lambda(t,x) = \sum_{j=1}^{J} \lambda_{j}(t,x)$.
+Here, $x$ represents covariates that impact the cause-specific hazards
+in a systematic way and allows us to write the hazard as:
+
+\begin{equation}
+\label{eqn:prop_hazard}
+\lambda_{j}(t) = \lambda_{0,j} \exp \left \{x_{t}\beta \right \}
+\end{equation}
+where $\lambda_{0,j}$ represents an unspecified baseline hazard.
+
+When durations are observed only over grouped intervals (we know an
+event occurred between period $t_{k-1}$ and period $t_{k}$), then
+the probability of observing an exit in the interval $[t_{k-1}, t_{k}]$
+can be derived as follows. Since the failure in this interval is the
+complement of surviving the interval, conditional on the observation
+having survived until period $t_{k-1}$, it can written as:
+
+\begin{eqnarray}\label{eq:grouped_hazard}
+P(y_{j,t_{k}} = 1) & = & 1 - P(T > t_{k}|T \geq t_{k-1}) \\
+               & = & 1 - \exp \left \{ -\exp(x_{t}'\beta) \int_{t_{k-1}}^{t_{k}}
+               \lambda_{0,j}(\tau) \mathrm{d}\tau \right \}
+\end{eqnarray}
+
+Defining the rightmost term as a constant:
+\begin{equation}
+\alpha_{t_{k}} = \log\left \{ \int_{t_{k-1}}^{t_{k}}
+    \lambda_{0,j}(\tau)\mathrm{d}\tau \right \}
+\end{equation}
+we can rewrite equation~\ref{eq:grouped_hazard} as follows:
+\begin{equation}\label{eq:grouped_hazard_final}
+P(y_{j,t_{k}} = 1) = 1 - \exp \left \{ -\exp(x_{t}'\beta + \alpha_{t_{k}} ) \right \}
+\end{equation}
+
+\begin{itemize}
+    \item This is a binary dependent variable with a complementary log-log link
+        and can be analyzed using standard discrete-choice models. The data is
+        structured in the form of a panel for each borrower, contributing 1 record
+        for every time unit that the loan is observed for.
+    \item A status indicator
+        represents whether the loan was still alive at the time of data
+        collection or had an event ($y_{t_{k}} = 0,1$).
+    \item The hazard function parameters can be estimated using either multinomial
+        models or equivalently as a set of pairwise binary dependent models in a
+        situation where multiple events are possible.
+\end{itemize}
+
+The likelihood function for this model can be derived as follows. Suppose we
+have observations $t_{i}$ on $N$ lifetimes of interest (e.g., time to a deferral
+request) and we also have, for each loan, an indicator variable $d_{i}$ which
+is 1 if $t_{i}$ denotes an observed time to a deferral request, and 0 otherwise.
+In the latter situation, the observation is considered ``censored''.
+
+The likelihood for an observation that is known to have deferred at time $t_{i}$
+can be written as the product of the survivor and hazard
+functions:
+\begin{equation}
+L_i = f(t_i) = S(t_i) \lambda(t_i).
+\end{equation}
+If we consider a censored observation, we have:
+\begin{equation}
+L_i = S(t_i),
+\end{equation}
+
+Since we have both types of observations, we know all observations lived
+at least until time $t_{i}$, but an observed deferral time with $d_{i} = 1$
+implies we need to multiply the survivor funtion by the hazard at time $t_{i}$.
+The combined likelihood across all observations is:
+\begin{equation}
+L = \prod_{i=1}^n L_i = \prod_i \lambda(t_i)^{d_i} S(t_i).
+\end{equation}
+Taking logs and simplifying, we have:
+\begin{equation}
+\log L = \sum_{i=1}^n \{ d_i \log \lambda(t_i) - \Lambda(t_i) \}.
+\end{equation}
+
+\subsubsection{Piecewise-exponential}
+In our specific case, we know the exact day on which the
+borrower's deferment request was approved. Thus, we can take advantage
+of this extra bit of information by treating time $t_{i}$ as continous,
+but in a setup where the observed times are bucketed into discrete
+intervals. This also allows us to accomodate covariates that may change 
+over the course of time $t_{i}$ but are external to the process
+and known at the start of each interval. Ths is referred to as Piece-Wise 
+Exponential (PWE) for the underlying baseline hazard $\lambda_{t}$ in the literature. 
+
+Under this specification, the time $t_{i}$ can be grouped into $J$ intervals, 
+[$\tau_{0}, \tau_{1}, \tau_{j-1},\tau_{j}, \dots, \tau_{J}$].
+If $t_{i} > \tau_{j}$, then the time spent in the interval is simply
+$\tau_{j} - \tau_{j-1}$. If the individual experienced an event or was
+censored in the interval $j$, then the time spent in that interval
+is $t_{ij} = t_{i} - \tau_{j-1}$. For each of these intervals, we
+can create a binary variable $d_{ij} = 0/1$ depending on whether
+the loan survived that interval and went into the next interval.
+
+The first term in the log-likelihood can now be written as:
+\begin{equation}
+d_i \log \lambda_i(t_i) = d_{ij(i)}\log\lambda_{ij(i)},
+\end{equation}
+
+The second term in the log-likelihood can be expressed as:
+\begin{equation}
+\Lambda_i(t_i) = \int_0^{t_i} \lambda_i(t)dt = \sum_{j=1}^{j(i)} t_{ij}\lambda_{ij},
+\end{equation}
+Here, we rely on the fact that the cumulative hazard integral is
+composed of $j(i)$ terms and can be represented as the sum of these ``mini''
+integrals. Each interval contributes the hazard $\lambda_{i}$ multiplied by
+the time spent in the interval, which is 1 for all except the last where it
+is $t_{ij}$. Since the $d_{ij}$ is zero for all intervals except the last,
+we can consolidate both terms in the log-likelihood under one summation:
+\begin{equation}
+\log L_i = \sum_{j=1}^{j(i)} \{ d_{ij}\log\lambda_{ij} - t_{ij}\lambda_{ij}\}.
+\end{equation}
+
+The contribution of each interval, which is a sub-observation for each loan,
+to the log-likelihood, is equivalent to the $d_{ij}$ being drawn from a
+Poisson distribution with mean $\mu_{ij} = t_{ij}\lambda_{ij}$. The likelihood
+for this would be written as:
+\begin{equation}
+\log L_{ij} = d_{ij}\log \mu_{ij} - \mu_{ij} =
+d_{ij}\log(t_{ij}\lambda_{ij}) - t_{ij}\lambda_{ij}.
+\end{equation}
+
+If we substitute $t_{ij}\lambda_{ij}$ for $\mu_{ij}$, we get
+\begin{equation}
+\log L_{ij} = d_{ij}\log \mu_{ij} - \mu_{ij} =
+d_{ij}\log(t_{ij}\lambda_{ij}) - t_{ij}\lambda_{ij}.
+\end{equation}
+
+This is the same as the previous formulation, with the exception of
+the $d_{ij}\log(t_{ij})$ term --- this is only valid for the last
+interval and so contributes $\log(t_{ij})$ to the log-likelihood.
+This is equivalent to a Poisson model with an offset term equal
+to $\log(t_{ij})$. This is the final model specification we use
+in this report.
+ 
+\subsection{Hierarchical}
+In order to extend this to a hierarchical bayesian framework, we make the
+additional assumption that some of the terms in $\beta$ are cluster-specific. In
+other words, the impact of this subset of variables on the deferment hazard is
+different for loans in different clusters. We treat each geographic region,
+more specifically, a state, as the cluster. All loans from the same state
+have a close relationship to each other, which may be the result of 
+state-specific laws, regulations and customs. In the case of COVID-19,
+given the state-specific nature of restrictions, the grouping is a natural
+one to consider.
+
+The schematic for the 
+hierarchical model (incorporating additional tweaks to aid in the sampling)
+is presented in Figure~\ref{fig:hierarchical_bayes_model_dag_pr}.
+The ``hierarchical'' nature of the parameters is clearly
+drawn as one moves from the top to the bottom of the
+graph, with the final step being the simulation from
+the posteriors using the observed value of the dichotomous
+deferment variable as the observed outcome.
+
+\begin{figure}[hbt!]
+\centering
+\caption{Hierarchical bayes model}
+\label{fig:hierarchical_bayes_model_dag_pr}
+\scalebox{0.5}{
+<<hierarchical_bayes_model_dag_pr, echo=False>>=
+zzz = pm.model_to_graphviz(hier_dict[omap["PR"]]["model"])
+_ = zzz.render(
+  directory="figures",
+  filename="pr_hier_model", format="png",
+  cleanup=True
+)
+@
+}
+\includegraphics[width=\linewidth]{figures/pr_hier_model.png}
+\end{figure}
+
+In our model, weekly initial claims since the start of the crisis, at the state
+level, are treated this way. Additionally, while
+we make every attempt to control for \emph{observable} hetereogeneity across
+loans, there may be unobserved factors that impact the deferment hazard. We
+model this as a ``frailty'' term that is state-specific, e.g., all loans within
+a state share the same unobserved factor. 
+
+In other words, the $x_{t}'\beta$ term in equation~\ref{eqn:prop_hazard} can be 
+expanded and rewritten as:
+
+\begin{equation}
+\label{eqn:hierarchical}
+\begin{array}{lcl}
+  x_{t}'\beta & = & b x_{ij} + \eta_{j} z_{ij} + \gamma_{j}\\
+  \eta_{j} & \sim & \mathcal{N}(\mu_{\eta}, \sigma_{\eta})\\
+  \gamma_{j} & \sim & \mathcal{N}(\mu_{\gamma}, \sigma_{\gamma})
+\end{array}
+\end{equation}
+
+By now, we have the basic outlines of the task at hand. We have a portfolio
+of loans, and on some of these, borrowers have asked the servicer for a
+deferral of payment. This is the result of an economic shock generated by 
+the widespread shutdowns in response to the COVID-19 virus. We want to understand
+how the probability of a borrower requesting a deferral depends on the attributes
+of the borrower and the loan, as well as state level metrics of labor market distress.
+
+The components of the $x$ and $z$ matrices are as follows:
+\begin{itemize}
+\item $x$: FICO, original balance, Debt-To-Income (DTI) ratio,
+  stated monthly income, loan age. In addition, we have categorical 
+  variables for loan credit grade, purpose, employment status, and
+  original term.
+\item $z$: Ratio of weekly claims (reported as of the Saturday
+  of the week) to the total state labor force at the start of the
+  crisis. Since the weekly intervals in which $t$ is observed coincides
+  with the claims reporting period, we are assuming that these are observed 
+  contemporaneously. In other word, the trigger for the decision to file
+  a claim and ask for a deferment occurred sometime in the past, but both
+  are recorded within the same week. The parameter measuring the impact
+  of changes in weekly claims for each loan is state-specific.
+\end{itemize}
+
+All right-hand-side variables are standardized by subtracting the
+mean and dividing by the standard deviation. In addition, all the
+categorical variables are encoded as dummmy variables with the first
+level of the category being treated as the reference category. This
+simplifies the interpretation of the model coefficients. The intercept
+term for each state can then be used to compute the probability of
+deferment for a ``reference'' loan. 
+
+In our case, for the first institution, this loan can 
+be defined as a \textbf{Grade 1} loan, with the following additional characterstics:\,
+\textbf{FICO:} <%print(f'{data_scaler_dict[omap["LC"]].mean_[0]:.2f}')%>, \,
+\textbf{Original Balance:} \$<%print(f'{data_scaler_dict[omap["LC"]].mean_[1]:,.2f}')%>, \,
+\textbf{DTI:} <%print(f'{(data_scaler_dict[omap["LC"]].mean_[2]):.2f}')%>\%, \,
+\textbf{Monthly Income:} \$<%print(f'{data_scaler_dict[omap["LC"]].mean_[3]:,.2f}')%>, \,
+\textbf{Age:} <%print(f'{data_scaler_dict[omap["LC"]].mean_[4]:.2f}')%> months. 
+
+For the second
+institution, the corresponding figures are as follows: \,
+\textbf{FICO:} <%print(f'{data_scaler_dict[omap["PR"]].mean_[0]:.2f}')%>, \,
+\textbf{Original Balance:} \$<%print(f'{data_scaler_dict[omap["PR"]].mean_[1]:,.2f}')%>, \,
+\textbf{DTI:} <%print(f'{(data_scaler_dict[omap["PR"]].mean_[2]):.2f}')%>\%, \,
+\textbf{Monthly Income:} \$<%print(f'{data_scaler_dict[omap["PR"]].mean_[3]:,.2f}')%>, \,
+\textbf{Age:} <%print(f'{data_scaler_dict[omap["PR"]].mean_[4]:.2f}')%> months. 
+
+It is further assumed
+that the borrower used the loan proceeds for \textbf{consolidating debt},
+that the borrower was either \textbf{employed} at the time of loan application
+or employment history information was available at the application date, 
+the \textbf{amortization term} of the loan was 3 years, and that the borrower 
+\textbf{owned} their home. In effect, for a loan that matches these attributes, 
+the $x$ term is a zero matrix, leaving the intercept as the only
+term on the right-hand side. 
+
+The variables in the $z$ matrix have a similar interpretation ---
+they represent the deviation from the mean of the weekly claims ratio.
+
+<<plot_fn, echo=False>>=
+def create_state_aggs(originator, hard_df, risk_df):
+    ''' pct deferment vs pct low risk '''
+    
+    xbar_df = hard_df.groupby(["originator", "state"]).agg(
+      n=("loan_id", "count"), k=('defer', np.sum),
+      pct=('defer', np.mean), balance=('cur_note_amount', sum)
+    ).loc[pd.IndexSlice[originator, :], :].droplevel(0).reset_index()
+    
+    xbar_df = pd.merge(xbar_df, risk_df, on="state")
+    
+    return xbar_df
+
+def defer_prob(df, hier_trace):
+    ''' deferment plots actual vs hierarchical '''
+    
+    data_df = df.copy()
+    
+    data_df = pd.concat(
+        [
+            data_df,
+            pd.Series(hier_trace["xbeta"].mean(axis=0), name="μ_xbeta"),
+            pd.Series(hier_trace["xbeta"].std(axis=0), name="σ_xbeta")
+        ], axis=1
+    )
+    
+    data_df["h_mean"] = common.chaz(data_df["μ_xbeta"])
+    data_df["h_lo"] = common.chaz(data_df["μ_xbeta"] - data_df["σ_xbeta"])
+    data_df["h_hi"] = common.chaz(data_df["μ_xbeta"] + data_df["σ_xbeta"])
+    
+    F_df = pd.merge(
+        (1 - np.exp(-data_df.groupby("loan_id")[["h_mean"]].sum())).rename(columns={"h_mean": "F_mean"}).reset_index(),
+        (1 - np.exp(-data_df.groupby("loan_id")[["h_lo"]].sum())).rename(columns={"h_lo": "F_lo"}).reset_index(),
+        on="loan_id"
+    ).merge(
+        (1 - np.exp(-data_df.groupby("loan_id")[["h_hi"]].sum())).rename(columns={"h_hi": "F_hi"}).reset_index(),
+        on="loan_id"
+    )
+    
+    data_df = pd.merge(data_df, F_df, on="loan_id", how="left")
+    data_df.drop_duplicates(subset=["loan_id"], keep="last", inplace=True)
+    data_df = data_df.groupby("state").agg(
+        F_mean=('F_mean', np.mean),
+        F_lo=('F_lo', np.mean),
+        F_hi=('F_hi', np.mean)
+    ).reset_index()
+        
+    return data_df
+
+def init_originator(originator):
+  ''' return originator specific pickled objects'''
+  
+  X = X_dict[originator]
+  X_risk = X_risk_dict[originator]
+  risk_df = risk_dict[originator]
+  data_df = data_dict[originator]
+  n_draws = n_draws_dict[originator]
+
+  states = list(risk_df["state"].unique())
+  states.sort()
+
+  data_scaler = data_scaler_dict[originator]
+  cat_vars = cat_vars_dict[originator]
+  cat_var_names = cat_var_names_dict[originator]
+  one_hot_enc = one_hot_enc_dict[originator]
+  formula = formula_dict[originator]
+
+  az_data, hier_model, hier_trace, posterior_predictive = make_az_data(
+    originator, hier_dict
+  )
+
+  return (
+    X, X_risk, risk_df, data_df, n_draws, states, data_scaler,
+    cat_vars, cat_var_names, one_hot_enc, formula, az_data,
+    hier_model, hier_trace, posterior_predictive
+  )
+@
+
+\section{Estimates}
+We now turn to a discussion of the results. We use the \href{https://docs.pymc.io/}{PyMC3} Python
+package to estimate the model. The hazard estimates depicted in
+Figure~\ref{fig:lc_nelson_aalen} were computed using the
+\href{https://lifelines.readthedocs.io/en/latest/#}{Lifelines}
+Python package.
+
+\subsection{Hazards}
+In this section, we present depictions of the marginal deferment
+probabilities (using 
+\href{https://en.wikipedia.org/wiki/Nelson%E2%80%93Aalen_estimator}{Nelson-Aalen hazards}
+), 
+to set the stage for what we should expect our fully-specified hazards to look like.
+
+\begin{figure}[ht]
+\centering
+\caption{Hazards}
+\label{fig:lc_nelson_aalen}
+\scalebox{1}{
+<<nelson_aalen, echo=False>>=
+T = hard_df.dur
+E = hard_df.defer
+
+bandwidth = 1
+naf = NelsonAalenFitter()
+lc = hard_df["originator"].isin([omap["LC"]])
+
+naf.fit(T[lc],event_observed=E[lc], label="Originator I")
+ax = naf.plot_hazard(bandwidth=bandwidth, figsize=(10, 5))
+
+naf.fit(T[~lc], event_observed=E[~lc], label="Originator II")
+naf.plot_hazard(ax=ax, bandwidth=bandwidth)
+
+ax.set_xlabel("Weeks since March 14th, 2020")
+ax.set_ylabel("Weekly hazard")
+
+_  = plt.xlim(0, hard_df.dur.max() + 1)
+@
+}
+\end{figure}
+
+The hazards rose sharply in the first weeks after the start of the crisis,
+to between 3\% and 4\%, but have declined since then. They reveal a difference
+in operating protocols where it appears that in the case of Originator I, 
+the initial flurry of claims were processed in a batch and then approved 
+all at once in the second week. The overall pattern of events and censoring 
+is presented in Table~\ref{tbl:survival_table_all}. The ``observed'' column
+indicates the count of loans where a deferment request was granted during
+the interval specified in the ``event-at'' column on the left. Since the
+study inception date is the same for all loans, a very large fraction
+of the data show up as ``censored''
+in the last interval, and reported under the censored column. The other entries
+in this column pertain to loans that either prepaid or were charged-off during
+the period starting March 14th, 2020 and the cutoff date. The removed
+column represents the portion of the ``at-risk'' population that is no longer
+at risk since the loan was either censored or experienced an event. The
+at-risk figure for the previous interval is decremented by the removed column
+for that interval to give a new at-risk number.
+
+\begin{table}
+\centering
+\caption{Survival table: all loans}
+\label{tbl:survival_table_all}
+\scalebox{1}{
+<<survival_table_all, echo=False, results="tex">>=
+lt_df = lifelines.utils.survival_table_from_events(
+    hard_df.dur, 
+    hard_df.defer, collapse=True
+)
+print(lt_df.to_latex(column_format='rrrrr'))
+@
+}
+
+\end{table}
+
+\subsection{Originator I}
+<<lc_az_data, echo=False>>=
+#
+originator = omap["LC"]
+(
+    X, X_risk, risk_df, data_df, n_draws, states, data_scaler,
+    cat_vars, cat_var_names, one_hot_enc, formula, az_data,
+    hier_model, hier_trace, posterior_predictive
+) = init_originator(originator)
+
+
+def make_ppc_plot(posterior_predictive, data_df, n_draws):
+    ''' make ppc plot '''
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    y_hat = np.array([x.mean() for x in posterior_predictive['yobs']])
+    
+    ax.hist(y_hat, bins=19, alpha=0.5)
+    ax.axvline(data_df["defer"].mean())
+    
+    ax.set(xlabel='Deferment Pct.', ylabel='Frequency')
+    ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    
+    pctile = np.percentile([x.mean() for x in posterior_predictive['yobs']], q=[5, 95])
+    ymin, ymax = ax.get_ylim()
+    _ = ax.text(
+      1.2 * data_df["defer"].mean(), 0.8 * ymax,
+      f'95% HPD: [{pctile[0]:.2%}, {pctile[1]:.2%}]'
+    )
+
+    return fig
+@
+
+We first provide a summary of the estimates for the pooled model, in
+Table~\ref{tbl:lc_pooled_estimates}.
+
+\begin{table}
+\caption{Originator I: pooled estimates}
+\label{tbl:lc_pooled_estimates}
+\scalebox{1}{
+<<lc_pooled_estimates, echo=False, results="tex">>=
+pool_pymc3_dict = {}
+for v in [omap["LC"], omap["PR"]]:
+  pool_fname = "pool_r_" + v + ".pkl"
+  with open(files_dir + pool_fname, "rb") as f:
+    pool_pymc3_dict[v] = joblib.load(f)
+
+lc_pool_trace = pool_pymc3_dict[omap["LC"]]["trace"]
+
+nstart = len(data_df["start"].unique())
+vnames = ["a", "b", "η", ]
+pool_out_df = pm.summary(lc_pool_trace, var_names=vnames, round_to=3)
+pool_out_df["odds"] = np.exp(pool_out_df["mean"])
+pool_out_df.index = ["a[" + str(x) + "]" for x in range(nstart)] + X.columns.to_list() + ["η"] 
+print(
+  pool_out_df[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat", "odds"]].to_latex(
+     column_format="rrrrrrr", formatters={
+       "odds": utils.number
+     }
+  )
+)
+@
+}
+\end{table}
+
+First, we examine the posterior predictive distribution of the probability of the binary
+deferment outcome variable versus the observed deferment percent in
+the data. This is presented in Figure~\ref{fig:lc_ppc} where the vertical line
+represents the observed deferment percent while the barchart shows the distribtution of
+posterior predicted probabilities in the sample, together with the 95\% Highest Posterior
+Density (HPD) interval. Note that these are hazards and not unconditional probabilities.
+
+\begin{figure}[htb!]
+\caption{Originator I deferment rate: posterior predictive distribution}
+\label{fig:lc_ppc}
+\scalebox{1}{
+<<lc_ppc, echo=False>>=
+
+fig = make_ppc_plot(posterior_predictive, data_df, n_draws)
+fig.show()
+@
+}
+\end{figure}
+
+The mean of the distribution of predicted hazards matches the average
+deferment rate in the sample quite well. We have also examined other 
+standard metrics for measuring convergence for the MCMC sampler that support the
+the validity of the sampling results presented here but have witheld
+them in the interest of brevity.
+
+\subsubsection{State effects}
+
+In the first step, we examine the impact of regional variation in state deferment
+rates --- this the first level in our 2-level model. 
+The estimates for the odds ratios for the impact of claims on 
+deferment hazards are presented in Figure~\ref{fig:lc_claims_sensitivity}. These
+range from odds ratios of a few percentage points to 20\% - 22\%. 
+
+\begin{figure}[ht]
+\centering
+\caption{Originator I: claims sensitivity}
+\label{fig:lc_claims_sensitivity}
+\scalebox{1}{
+<<lc_claims_sensitivity, echo=False>>=
+η_df = az.summary(az_data, var_names=['η'], round_to=3)
+η_df.index = states
+η_df.sort_values(by=["mean"], inplace=True)
+η_df = η_df.reset_index().rename(columns={"index": "state"})
+η_df["mean"] = np.exp(η_df["mean"])
+                                 
+g = sns.catplot(data=η_df, x="state", y="mean", kind="point")
+g.ax.figure.set_size_inches(10, 5)
+g.ax.set_xlabel("State")
+g.ax.set_ylabel("Claims odds")
+g.ax.set_xticklabels(η_df.state, rotation=45, size=10)
+
+sns.despine(left=True)
+@
+}
+
+\end{figure}
+
+\begin{table}[htb]
+\centering
+\caption{Originator I: claims effects}
+\label{tbl:lc_claims_table}
+\scalebox{1}{
+<<lc_claims_table, echo=False, results="tex">>=
+η_out =az.summary(az_data, var_names=["μ_η", "σ_η"], round_to=3)
+η_out["odds"] = np.where(η_out.index == "μ_η", np.exp(η_out["mean"]), np.NaN)
+
+print(η_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat", "odds"]].to_latex(
+  index=True, column_format="rrrrrrr", formatters={
+    "odds": utils.number
+    }, na_rep=" "
+  )
+)
+@
+}
+\end{table}
+
+The coefficient on the claims variable is positive and as
+expected. A 1 standard-deviation (about 
+<%print(f'{100 * data_scaler_dict[omap["LC"]].mean_[5]:.2f}')%>
+\%) increase in the claims ratio
+implies a <%print(f'{100*(η_out.loc["μ_η", "odds"]-1):.2f}') %>\%
+increase in the odds of deferment.
+
+In Figure~\ref{fig:lc_pred_base_prob}, the  
+regional variation for the ``average'' loan 
+predicted by the hierarchical model is presented. 
+\begin{figure}[hbt!]
+\centering
+\caption{Originator I: Predicted baseline deferment probability}
+\label{fig:lc_pred_base_prob}
+\scalebox{1}{
+<<lc_pred_base_prob, echo=False>>=
+
+state_agg_df = create_state_aggs(originator, hard_df, risk_df)
+defer_df = defer_prob(data_df, hier_trace)
+
+xbar_df = pd.merge(state_agg_df, defer_df, on="state")
+xbar_df.sort_values(by=["pct"], inplace=True)
+
+# plot 
+fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+x = np.arange(xbar_df.index.max()+1)
+
+ax.plot(x, xbar_df.F_mean, color="green", label="Shrinkage", linestyle="--")
+ax.scatter(x, xbar_df.pct, color="red", label="MLE", alpha=0.5)
+ax.fill_between(
+    x, xbar_df.F_lo, xbar_df.F_hi, alpha=0.25, color='C1'
+)
+
+ax.set_xlabel("State")
+ax.set_ylabel(f'Deferment Pct.: Week {data_df["stop"].astype(int).max()-1}')
+ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+plt.xticks(x)
+ax.set_xticklabels(xbar_df.state, rotation=45, size=10)
+plt.legend(loc="upper left")
+sns.despine(left=True)
+@
+}
+\end{figure}
+%The ``spike'' in the deferment probability in Figure~\ref{fig:lc_pred_base_prob}
+%is due to the presence of only a single loan from the DC area which happens to be at the 
+%high end of the deferment risk spectrum.
+
+The dots indicate the deferment percentage observed in each state, while the line 
+indicates the mean estimate, with the shaded area representing the 1-standard
+deviation range for deferment probabilities. The hierarchical 
+model generates predictions that are different by design than the empirical mean deferment 
+rate (which is the Maximum-Likelihood Estimator (MLE)) since it ``borrows'' from other 
+groups to create a more efficient predictor than the simple unpooled
+estimator. The greater the number of observations in each cluster, the weaker
+this borrowing effect is. As is visually apparent, the estimates for each cluster
+are pulled towards the mean from both ends, and the strength of the attraction
+is a function of the number of observations within each cluster.
+
+\subsubsection{Covariate effects}
+In Figure~\ref{fig:lc_covar_effects_plot} and Table~\ref{tbl:lc_covariate_table}, 
+we present the estimated coefficents for the covariates in our model. Note 
+that these estimates act as ``shifters'' in that they move
+the probability of deferment for the baseline loan up or 
+down. Since all our covariates are standardized (have a mean
+of 0 and a standard deviation of 1), the impact of 
+a 1 standard-deviation move in the covariate on the 
+``odds-ratio'' ($\frac{p}{1-p}$) can be estimated by
+exponentiating the coefficent value.
+
+\begin{table}[htb]
+\centering
+\caption{Originator I: covariate effects}
+\label{tbl:lc_covariate_table}
+\scalebox{1}{
+<<lc_covariate_table, echo=False, results="tex">>=
+b_out = az.summary(az_data, var_names=['b'], round_to=3)
+b_out["odds"] = np.exp(b_out["mean"])
+b_out.index = X.columns.to_list()
+print(b_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat", "odds"]].to_latex(
+  index=True, column_format="rrrrrrr", formatters={
+    "odds": utils.number
+  },
+  )
+)
+
+@
+}
+\end{table}
+
+\begin{figure}[hbt]
+\centering
+\caption{Originator I: covariate effects}
+\label{fig:lc_covar_effects_plot}
+\scalebox{1}{
+<<lc_covar_effects_plot, echo=False>>=
+ax = az.plot_forest(az_data, var_names=["b"], combined=True, figsize=(10, 5))
+ax[0].set_yticklabels(reversed(X.columns.to_list()))
+grade_vars = [x for x in X.columns.to_list() if "grade" in x and not "fico" in x]
+@
+}
+\end{figure}
+
+We discuss the results for each covariate in turn:
+\begin{description}
+\item [Grade:] The credit grade estimates represent the impact of each grade relative to
+  the reference category which defines the baseline loan. The odds-ratio 
+  indicate relatively modest ``shifts'' for the 2nd category, but are 
+  more onerous for the other lower-grade categories. The mean odds ratio of 
+  <%print(f'{abs(b_out.loc[grade_vars[1], "odds"]):.2f}')%>,
+  <%print(f'{abs(b_out.loc[grade_vars[2], "odds"]):.2f}')%> and
+  <%print(f'{abs(b_out.loc[grade_vars[3], "odds"]):.2f}')%>
+  indicate substantially higher risks relative to the baseline loan. Note that
+  we are controlliing for FICO scores as another covariate in the model so these
+  effects are net of FICO composition effects within grades.
+
+  \item [Purpose:] Loans taken out for asset puchases are
+    <%print(f'{100*abs(b_out.loc["C(purpose)[T.Acquisition]", "odds"]-1.0):.0f}')%>\% 
+    riskier than the baseline ``Debt-Consolidation'' category. The ``LifeCycle''
+    and the catch-all ``Other'' category are
+    <%print(f'{100*abs(b_out.loc["C(purpose)[T.LifeCycle]", "odds"]-1.0):.0f}')%>\%
+    and
+    <%print(f'{100*abs(b_out.loc["C(purpose)[T.Other]", "odds"]-1.0):.0f}')%>\%
+    less risky than the baseline category, respectively.
+  
+  \item [Employment status:] Borrowers categorized as ``Other'' for this variable are lower risk than 
+    borrowers with recorded employment histories\footnote{In the case of Originator I, the 
+    ``Self-employed'' tag is an empty dummy indicator with a value of 0 for all observations.}. 
+
+  \item [Term:] 5-year loans are slightly higher risk than 3-year loans.
+
+  \item [Homeownership:] Renters are about %
+    <%print(f'{100*abs(b_out.loc["C(home_ownership)[T.Rent]", "odds"]-1.0):.0f}')%>\%
+    higher risk than borrowers that own their home.
+
+  \item [FICO:] a 1 standard-deviation (about <%print(f'{data_scaler_dict[omap["LC"]].scale_[0]:.0f}')%> 
+    points) increase in FICO, all else equal, causes the odds-ratio to increase by %
+    <%print(f'{100*abs(b_out.loc["fico_s", "odds"]-1.0):.0f}')%>\%.
+
+  \item [Original Balance:] a 1 standard-deviation (about \$<%print(f'{data_scaler_dict[omap["LC"]].scale_[1]:,.0f}')%>)
+    increase in original balance causes the odds-ratio to increase by %
+    <%print(f'{100*abs(b_out.loc["original_balance_s", "odds"]-1.0):.0f}')%>\%.
+
+  \item [DTI:] a 1 standard-deviation (about <%print(f'{data_scaler_dict[omap["LC"]].scale_[2]:.2f}')%>\%)
+    higher DTI causes the odds-ratio to decrease by %
+    <%print(f'{100*abs(b_out.loc["dti_s", "odds"]-1.0):.0f}')%>\%.
+
+  \item [Income:]  a 1 standard-deviation (about \$<%print(f'{data_scaler_dict[omap["LC"]].scale_[3]:,.2f}')%>)
+    increase in monthly income causes the odds-ratio to decrease by %
+    <%print(f'{100*abs(b_out.loc["stated_monthly_income_s", "odds"]-1.0):.0f}')%>\%.
+  
+  \item [Seasoning:] a 1 standard-deviation (about <%print(f'{data_scaler_dict[omap["LC"]].scale_[4]:.0f}')%>
+    months) increase in loan age causes the odds-ratio to decrease by %
+    <%print(f'{100*abs(b_out.loc["age_s", "odds"]-1.0):.0f}')%>\%.
+  
+\end{description}
+
+\subsection{Originator II}
+
+<<pr_az_data, echo=False>>=
+originator = omap["PR"]
+(
+    X, X_risk, risk_df, data_df, n_draws, states, data_scaler,
+    cat_vars, cat_var_names, one_hot_enc, formula, az_data,
+    hier_model, hier_trace, posterior_predictive
+) = init_originator(originator)
+@
+
+\begin{table}
+\caption{Originator II: pooled estimates}
+\label{tbl:pr_pooled_estimates}
+\scalebox{1}{
+<<pr_pooled_estimates, echo=False, results="tex">>=
+
+nstart = len(data_df["start"].unique())
+pr_pool_trace = pool_pymc3_dict[omap["PR"]]["trace"]
+vnames = ["a", "b", "η", ]
+pool_out_df = pm.summary(pr_pool_trace, var_names=vnames, round_to=3)
+pool_out_df["odds"] = np.exp(pool_out_df["mean"])
+pool_out_df.index = ["a[" + str(x)  + "]" for x in range(nstart)] + X.columns.to_list() + ["η"] 
+print(
+  pool_out_df[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat", "odds"]].to_latex(
+     column_format="rrrrrrr", formatters={
+       "odds": utils.number
+     }
+  )
+)
+@
+}
+\end{table}
+
+We first examine the posterior predictive distribution
+of the probability of the binary deferment outcome variable versus
+the observed deferment percent in the data. This is presented in
+Figure~\ref{fig:pr_ppc}. 
+
+\begin{figure}[htb!]
+\caption{Originator II deferment rate: posterior predictive distribution}
+\label{fig:pr_ppc}
+\scalebox{1}{
+<<pr_ppc, echo=False>>=
+fig = make_ppc_plot(posterior_predictive, data_df, n_draws)
+fig.show()
+@
+}
+\end{figure}
+
+\subsubsection{State effects}
+The estimates for the odds ratios for the impact of claims on 
+deferment hazards for originator II are presented in 
+Figure~\ref{fig:pr_claims_sensitivity}. Notably, while the
+range of odds ratios on the claims variable is the about the
+same for Originator II compared to Originator I, the state
+rankings are very different. For example, NJ moves from being
+least sensitive to most sensitive. These differences are possibly
+the result of pool composition effects and highlight the importance
+of segmenting the data in sensible ways to bring out these differences.
+
+\begin{figure}[ht]
+\centering
+\caption{Originator II: claims sensitivity}
+\label{fig:pr_claims_sensitivity}
+\scalebox{1}{
+<<pr_claims_sensitivity, echo=False>>=
+η_df = az.summary(az_data, var_names=['η'], round_to=3)
+η_df.index = states
+η_df.sort_values(by=["mean"], inplace=True)
+η_df = η_df.reset_index().rename(columns={"index": "state"})
+η_df["mean"] = np.exp(η_df["mean"])
+                                 
+g = sns.catplot(data=η_df, x="state", y="mean", kind="point")
+g.ax.figure.set_size_inches(10, 5)
+g.ax.set_xlabel("State")
+g.ax.set_ylabel("Claims odds")
+g.ax.set_xticklabels(η_df.state, rotation=45, size=10)
+
+sns.despine(left=True)
+@
+}
+\end{figure}
+
+\begin{table}[htb]
+\centering
+\caption{Originator II: claims effects}
+\label{tbl:pr_claims_table}
+\scalebox{1}{
+<<pr_claims_table, echo=False, results="tex">>=
+η_out =az.summary(az_data, var_names=["μ_η", "σ_η"], round_to=3)
+η_out["odds"] = np.where(η_out.index == "μ_η", np.exp(η_out["mean"]), np.NaN)
+
+print(η_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat", "odds"]].to_latex(
+  index=True, column_format="rrrrrrr", formatters={
+    "odds": utils.number
+    }, na_rep=" "
+  )
+)
+@
+}
+\end{table}
+
+The coefficient on the claims variable is positive and as
+expected. A 1 standard-deviation (about 
+<%print(f'{100 * data_scaler_dict[omap["LC"]].mean_[5]:.2f}')%>
+\%) increase in the claims ratio
+implies a <%print(f'{100*(η_out.loc["μ_η", "odds"]-1):.2f}') %>
+\% increase in the odds of deferment, slightly lower than the
+parameter estimate for Originator I.
+
+\begin{figure}[hbt!]
+\centering
+\caption{Originator II: Predicted baseline deferment probability}
+\label{fig:pr_pred_base_prob}
+\scalebox{1}{
+<<pr_pred_base_prob, echo=False>>=
+state_agg_df = create_state_aggs(originator, hard_df, risk_df)
+defer_df = defer_prob(data_df, hier_trace)
+xbar_df = pd.merge(state_agg_df, defer_df, on="state")
+xbar_df.sort_values(by=["pct"], inplace=True)
+
+# plot 
+fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+x = np.arange(xbar_df.index.max()+1)
+
+ax.plot(x, xbar_df.F_mean, color="green", label="Shrinkage", linestyle="--")
+ax.scatter(x, xbar_df.pct, color="red", label="MLE", alpha=0.5)
+ax.fill_between(
+    x, xbar_df.F_lo, xbar_df.F_hi, alpha=0.25, color='C1'
+)
+
+ax.set_xlabel("State")
+ax.set_ylabel(f'Deferment Pct.: Week {data_df["stop"].astype(int).max()-1}')
+ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+plt.xticks(x)
+ax.set_xticklabels(xbar_df.state, rotation=45, size=10)
+plt.legend(loc="upper left")
+sns.despine(left=True)
+@
+}
+\end{figure}
+
+In Figure~\ref{fig:pr_pred_base_prob}, the regional variation for the 
+``average'' loan predicted by the hierarchical model is presented. The
+comments we made earlier regarding the role of ``shrinkage'' to the
+mean are applicable here as well.
+
+\subsubsection{Covariate effects}
+
+\begin{table}[htb]
+\centering
+\caption{Originator II: covariate effects}
+\label{tbl:pr_covariate_table}
+\scalebox{1}{
+<<pr_covariate_table, echo=False, results="tex">>=
+b_out = az.summary(az_data, var_names=['b'], round_to=3)
+b_out["odds"] = np.exp(b_out["mean"])
+b_out.index = X.columns.to_list()
+print(b_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat", "odds"]].to_latex(
+  index=True, column_format="rrrrrrr", formatters={
+    "odds": utils.number
+    }
+  )
+)
+@
+}
+\end{table}
+
+\begin{figure}[hbt!]
+\centering
+\caption{Originator II: covariate effects}
+\label{tbl:pr_covar_effects_plot}
+\scalebox{1}{
+<<pr_covar_effects_plot, echo=False>>=
+ax = az.plot_forest(az_data, var_names=["b"], combined=True, figsize=(10, 5))
+_ = ax[0].set_yticklabels(reversed(X.columns.to_list()))
+grade_vars = [x for x in X.columns.to_list() if "grade" in x and not "fico" in x]
+@
+}
+\end{figure}
+
+We discuss the results for each covariate in turn:
+\begin{description}
+\item [Grade:] The credit grade estimates represent the impact of each grade relative to
+  the reference category which defines the baseline loan. The odds-ratio 
+  indicate negative ``shifts'' for the 2nd and 3rd categories, but are 
+  more onerous for the other lower-grade categories, except for the last. 
+  The mean odds ratio of 
+  <%print(f'{abs(b_out.loc[grade_vars[3], "odds"]):.2f}')%>,
+  <%print(f'{abs(b_out.loc[grade_vars[4], "odds"]):.2f}')%> and 
+  <%print(f'{abs(b_out.loc[grade_vars[5], "odds"]):.2f}')%>
+  indicate relative risks of around 1.5 times the baseline loan. Note that
+  we are controlliing for FICO scores as another covariate in the model so these
+  effects are net of FICO composition effects within grades. 
+
+  \item [Purpose:] Loans taken out for asset puchases are
+    <%print(f'{100*abs(b_out.loc["C(purpose)[T.Acquisition]", "odds"]-1.0):.0f}')%>\%
+    riskier than the baseline ``Debt-Consolidation'' category. The ``LifeCycle''
+    and the catch-all ``Other'' category are
+    <%print(f'{100*abs(b_out.loc["C(purpose)[T.LifeCycle]", "odds"]-1.0):.0f}')%>\%
+    and
+    <%print(f'{100*abs(b_out.loc["C(purpose)[T.Other]", "odds"]-1.0):.0f}')%>\%
+    less risky than the baseline category, respectively.
+  
+  \item [Employment status:] Self-employed borrowers are  
+    <%print(f'{100*abs(b_out.loc["C(employment_status)[T.Self-employed]", "odds"]-1.0):.0f}')%>\% riskier
+    than employed borrowers.
+
+  \item [Term:] 5-year loans are about
+    <%print(f'{100*abs(b_out.loc["C(term)[T.Y5]", "odds"]-1.0):.0f}')%>\% riskier than
+    3-year loans
+
+  \item [Homeownership:] Renters are about %
+    <%print(f'{100*abs(b_out.loc["C(home_ownership)[T.Rent]", "odds"]-1.0):.0f}')%>\%
+    higher risk than borrowers that own their home.
+
+  \item [FICO:] a 1 standard-deviation (about <%print(f'{data_scaler_dict[omap["PR"]].scale_[0]:.0f}')%> 
+    points) increase in FICO, all else equal, causes the odds-ratio to decrease by %
+    <%print(f'{100*abs(b_out.loc["fico_s", "odds"]-1.0):.0f}')%>\%.
+
+  \item [Original Balance:] a 1 standard-deviation (about \$<%print(f'{data_scaler_dict[omap["PR"]].scale_[1]:,.0f}')%>)
+   increase in original balance causes the odds-ratio to increase by %
+    <%print(f'{100*abs(b_out.loc["original_balance_s", "odds"]-1.0):.0f}')%>\%.
+
+  \item [DTI:] a 1 standard-deviation (about <%print(f'{data_scaler_dict[omap["PR"]].scale_[2]:.2f}')%>\%)
+    higher DTI causes the odds-ratio to decrease by %
+    <%print(f'{100*abs(b_out.loc["dti_s", "odds"]-1.0):.0f}')%>\%.
+
+  \item [Income:]  a 1 standard-deviation (about \$<%print(f'{data_scaler_dict[omap["PR"]].scale_[3]:,.2f}')%>)
+    increase in monthly income causes the odds-ratio to decrease by %
+    <%print(f'{100*abs(b_out.loc["stated_monthly_income_s", "odds"]-1.0):.0f}')%>\%.
+  
+  \item [Seasoning:] a 1 standard-deviation (about <%print(f'{data_scaler_dict[omap["PR"]].scale_[4]:.0f}')%>
+    months) increase in loan age causes the odds-ratio to decrease by %
+    <%print(f'{100*abs(b_out.loc["age_s", "odds"]-1.0):.0f}')%>\%.
+  
+\end{description}
+
+\section{Claims}
+Now that we have an idea about the impact of job losses on deferral
+rates, we need to develop a framework for thinking about near-term
+job losses after the initial shock observed in late March. What could the 
+path of initial claims be over the next few months, and what should we expect in 
+terms of the total number of claims during thi period? We turn towards
+this question now.
+
+In \cite{bramdeitz}, an interesting idea to answer this question is explored
+--- that the COVID shock to labor markets is more akin to a natural disaster like
+hurricane Katrina or Maria, rather than a classic recession-induced
+hit to employment. As they correctly point out
+\begin{quote}
+  \emph{Recessions typically develop gradually over time, reflecting underlying 
+  economic and financial conditions, whereas the current economic situation
+  developed suddenly as a consequence of a fast-moving global pandemic.
+  A more appropriate comparison would be to a regional economy suffering 
+  the effects of a severe natural disaster, like Louisiana after Hurricane 
+  Katrina or Puerto Rico after Hurricane Maria. To illustrate this point, we 
+  track the recent path of unemployment claims in the United States, finding a 
+  much closer match with Louisiana after Katrina than the U.S. economy 
+  following the Great Recession.
+  }
+\end{quote}
+
+While the national scope of the COVID shock is clearly different and unprecedented,
+there are similarities with natural disasters which by their nature, tend to 
+be more localized. As such, they can provide insights into the way labor markets
+evolve in the short-run. We do this by estimating exponential decay models for
+different episodes, both natural-disaster related or recession-driven, and 
+calibrate the parameters of this process to the historical data on claims.
+
+\subsection{Model}
+To be precise, we posit that initial claims, normalized to their peak
+value during each episode, follow:
+
+\begin{equation}
+\label{eqn:ic_process}
+y_{t} = A \exp(-\kappa x^{\beta})\epsilon_{t}
+\end{equation}
+where $x$ is the number of weeks from the peak of initial claims
+during the episode and $\epsilon_{t} \sim \mathcal{LN}(0,\, \sigma_{y})$%
+\footnote{Estimating the model in logarithms linearizes it and
+makes the right-hand side additive.}. 
+The parameter $A$ is normalized to 1, so we just have the
+2 parameters $\kappa$ and $\beta$ to estimate. We go further and 
+specify episode-specific parameters that drive this process, so
+these become $\kappa_{j}$ and $\beta_{j}$ where $j$ is an 
+episode-specific index. The smaller the $\kappa$ parameter,
+the longer it takes for the iniital shock to claims to taper down.
+
+<<claims_setup, echo=False>>=
+fname = files_dir + "claims.pkl"
+with open(fname, "rb") as f:
+  claims_dict = joblib.load(f)
+
+claims_az_data = claims_dict["az_data"]
+claims_sum_df = claims_dict["sum_df"]
+claims_trace = claims_dict["trace"]
+claims_data = claims_dict["data"]
+claims_epi_enc = claims_dict["epi_enc"]
+claims_sim_dict = claims_dict["sim_dict"]
+
+A = 0
+κ = claims_trace["κ"]
+β = claims_trace["β"]
+
+def project_claims(state, covid_wt, sum_df, epi_enc, verbose=False):
+    ''' get labor market data from STL '''
+    
+    def states_data(suffix, state, fred):
+        ''' gets data from FRED for a list of indices '''
+
+        idx = "ICSA" if state == "US" else state + suffix            
+        x =  pd.Series(
+                fred.get_series(
+                    idx, observation_start=common.START_DATE), name=v
+            )
+
+        x.name = state
+
+        return x
+    
+    def forecast_claims(initval, initdate, enddate, covit_wt):
+        ''' project initial claims '''
+    
+        μ_β = sum_df.loc["β", "mean"]
+        μ_κ = sum_df.loc[["κ: COVID", "κ: Katrina"], "mean"].values
+        μ_decay = covid_wt * μ_κ[0] + (1 - covid_wt) * μ_κ[1]
+        
+        dt_range = (
+            pd.date_range(start=initdate, end=enddate, freq="W") - 
+            pd.tseries.offsets.Day(1)
+        )
+        max_x = len(dt_range)
+        
+        w = np.arange(max_x)
+        covid_idx = list(epi_enc.classes_).index("COVID")
+        katrina_idx = list(epi_enc.classes_).index("Katrina")
+
+        decay = covid_wt * κ[:, covid_idx] + (1 - covid_wt) * κ[:, katrina_idx]
+        μ = np.exp(-decay * np.power(w.reshape(-1, 1), β))
+        
+        μ_df = pd.DataFrame(
+            np.percentile(μ, q=[5, 25, 50, 75, 95], axis=1).T, 
+            columns=["5th", "25th", "50th", "75th", "95th"]
+        ) * initval
+        μ_df["period"] = w
+        
+        ic = np.zeros(max_x)
+        ic[0] = 1
+        for j in np.arange(1, max_x, 1):
+            ic[j] = np.exp(-μ_decay * np.power(j, μ_β))
+        
+        df = pd.concat(
+            [
+                pd.Series(np.arange(max_x), name="period"),
+                pd.Series(ic, name="ic_ratio"),
+                pd.Series(ic * initval, name="ic"),
+                pd.Series((ic * initval).cumsum(), name="cum_ic")
+            ], axis=1
+        )
+        
+        df.index = dt_range
+        μ_df.index = dt_range
+    
+        return df, μ_df
+    
+        
+    fred = common.Fred(api_key=common.FRED_API_KEY)
+    ic_raw = states_data("ICLAIMS", state, fred)
+
+    init_value, init_date, last_date = ic_raw[ic_raw.idxmax()], ic_raw.idxmax(), ic_raw.index[-1]
+    end_date  = last_date + pd.tseries.offsets.QuarterEnd() 
+    if verbose:
+      print(f'State: {state}, {init_value}, {init_date}, {end_date}')
+    
+    ic_fct, ic_pct = forecast_claims(init_value, init_date, end_date, covid_wt)
+    ic_fct["state"] = state
+    ic_pct["state"] = state
+    
+    return ic_raw, ic_fct, ic_pct, init_date
+@
+
+\subsection{Results}
+In Table~\ref{tbl:claims_decay_tbl}, we present the results of the
+exponential decay model. 
+The $\kappa$ parameter ranges from a low
+of <%print(f'{claims_sum_df.loc["κ: GFC", "mean"]:.2f}') %> during
+the Great Recession (GFC) to 
+a high of <%print(f'{claims_sum_df.loc["κ: Katrina", "mean"]:.2f}') %>
+in the aftermath of Katrina. The estimate for the current COVID
+episode is <%print(f'{claims_sum_df.loc["κ: COVID", "mean"]:.2f}') %>,
+in between the 2 but subject to considerable uncertainty given we
+are still early in the process. As more data becomes available, 
+the 95\% credibility intervals will shrink but we have to be
+cognizant of the fact that any projections will of necessity be
+subject to fairly wide error bands. Regardless, the initial
+results out of the gate suggest a pattern of behavior more in
+line with natural disasters rather than the longer tapering
+timeframes evidenced during and after recessions%
+\footnote{Based on a judgment call given some of the early
+fit results, we used a weighted $\kappa$ value 
+for the claims projections, using a 90\% weight on the COVID value
+and a 10\% weight on the Katrina value.}.
+
+\begin{table}[htb]
+\centering
+\caption{Initial claims: exponential-decay}
+\label{tbl:claims_decay_tbl}
+\scalebox{1}{
+<<claims_decay_tbl, echo=False, results="tex">>=
+print(
+  claims_sum_df[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]].to_latex(
+     column_format="rrrrrr"
+  )
+)
+@
+}
+
+\end{table}
+In Figure~\ref{fig:claims_model_fits}, we present the model predictions and
+the associated 1 and 2 standard deviation ranges versus the observed data
+on claims (relative to the peak) for each episode. Overall, the fits match
+the historical experience quite well, except for the aftermath of Hurricane
+Sandy where the initial data points come down much more sharply than the
+model predictions. Note the relatively wide confidence bands for both 
+the current ``COVID'' episode and the history of claims after 9/11.
+
+\begin{figure}[htb]
+\centering
+\caption{Model fits \emph{vs} actuals}
+\label{fig:claims_model_fits}
+\scalebox{1}{
+<<claims_model_fits, echo=False>>=
+fig, ax = plt.subplots(2, 3, figsize=(12, 6))
+
+for i, v in enumerate(["κ: " + x for x in claims_epi_enc.classes_]):
+    
+    xx = claims_data[claims_data.epi_idx==i]["x"].values
+    yy = claims_data[claims_data.epi_idx==i]["y"].values
+    xx = xx.reshape((xx.max() + 1, 1))
+    
+    mu = A - κ[:, i].reshape(-1,1) * np.power(xx, β).T
+    ic_hat_means = mu.mean(axis=0)
+    ic_hat_se = mu.std(axis=0)
+    
+    j = i % 3
+    l = 0 if i < 3 else 1
+    ax[l, j].plot(xx, yy, 'C0.')
+    ax[l, j].plot(xx, np.exp(ic_hat_means), c='k')
+
+    ax[l, j].fill_between(
+        xx[:, 0], np.exp(ic_hat_means + 1 * ic_hat_se),
+        np.exp(ic_hat_means - 1 * ic_hat_se), alpha=0.6,
+        color='C1'
+    )
+    ax[l, j].fill_between(
+        xx[:, 0], np.exp(ic_hat_means + 2 * ic_hat_se),
+        np.exp(ic_hat_means - 2 * ic_hat_se), alpha=0.4,
+        color='C1'
+    )
+    ax[l, j].set_xlabel('Weeks since peak')
+    ax[l, j].set_ylabel('Pct. of peak')
+    ax[l, j].set_title(f'Episode: {v} = {claims_sum_df.loc[v, "mean"]}')
+    
+fig.tight_layout()
+@
+}
+
+\end{figure}
+
+\subsection{Forecasts}
+In Figure~\ref{fig:cum_ic_claim}, we present the forecast for the US
+over a 13-week horizon. Both weekly and cumulative claim totals
+since the start of the episodic peak are presented. 
+
+\begin{figure}[htb]
+\centering
+\caption{Initial claim projections: US}
+\label{fig:cum_ic_claim}
+\scalebox{1}{
+<<cum_ic_claim, echo=False>>=
+covid_wt = 0.9
+
+ic_raw, fct_df, ic_pct, init_date = project_claims(
+  "US", covid_wt, claims_sum_df, claims_epi_enc
+)
+
+fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+
+ax[0].plot(ic_pct["period"], ic_pct["50th"].cumsum())
+ax[0].scatter(
+  claims_data[claims_data.epi_idx==1]["x"], 
+  (claims_data[claims_data.epi_idx==1]["y"] * ic_pct.iloc[0, 1]).cumsum()
+)
+ax[0].fill_between(
+    ic_pct["period"], (ic_pct["25th"]).cumsum(), (ic_pct["75th"]).cumsum(), 
+    alpha=0.6, color='C1'
+)
+ax[0].fill_between(
+    ic_pct["period"], ic_pct["5th"].cumsum(), ic_pct["95th"].cumsum(), alpha=0.4,
+    color='C1'
+)
+ax[0].yaxis.set_major_formatter(mtick.StrMethodFormatter("{x:,.0f}"))
+ax[0].set(xlabel='Weeks from peak', ylabel='Cum. initial claims')
+
+ax[1].plot(ic_pct["period"], ic_pct["50th"])
+ax[1].scatter(
+  claims_data[claims_data.epi_idx==1]["x"], 
+  (claims_data[claims_data.epi_idx==1]["y"] * ic_pct.iloc[0, 1])
+)
+ax[1].fill_between(
+    ic_pct["period"], (ic_pct["25th"]), (ic_pct["75th"]), alpha=0.6, color='C1'
+)
+ax[1].fill_between(
+    ic_pct["period"], ic_pct["5th"], ic_pct["95th"], alpha=0.4,
+    color='C1'
+)
+ax[1].yaxis.set_major_formatter(mtick.StrMethodFormatter("{x:,.0f}"))
+ax[1].set(xlabel='Weeks from peak', ylabel='Initial claims')
+
+plt.tight_layout()
+@
+}
+\end{figure}
+
+\textbf{Since the peak on <%print(f'{init_date.strftime("%B %-d, %Y")}') %>, the model generates a 
+median cumulative claims estimate of <%print(f'{1.e-6*ic_pct["50th"].cumsum()[-1]:,.2f}')%>
+million, with a 95\% confidence band of %
+<%print(f'{1.e-6*ic_pct["5th"].cumsum()[-1]:.2f}') %> million and %
+<%print(f'{1.e-6*ic_pct["95th"].cumsum()[-1]:.2f}') %> million claims. }
+The middle half of the projections span the range from
+<%print(f'{1.e-6*ic_pct["25th"].cumsum()[-1]:.2f}') %> million to %
+<%print(f'{1.e-6*ic_pct["75th"].cumsum()[-1]:.2f}') %> million claims. 
+While the 95\% confidence bands for cumulative claims are relatively wide
+(over the entire 13 week period), they simply reflect the uncertainty inherent in
+the fact that we are still early in the process. Given the current total of roughly
+26 million claims already incurred, the median estimate calls for roughly double
+the current amount over the weeks remaining in the second quarter.
+
+\section{Deferments}
+In this section, we take the pools from the 2 originators we've studied in
+this report and project the cumulative deferment probabilities out until
+the end of the second quarter. We do this by using the deferment hazard 
+model and feeding into it the claims forecast we generated in the previous
+section. The claims forecast for each state is generated by taking the US
+decay factor projection and applying it to the peak claims figure for the
+state.
+
+<<deferment_projection, echo=False>>=
+ORIGINATOR = omap["LC"]
+(
+    X, X_risk, risk_df, data_df, n_draws, states, data_scaler,
+    cat_vars, cat_var_names, one_hot_enc, formula, az_data,
+    hier_model, hier_trace, posterior_predictive
+) = init_originator(ORIGINATOR)
+
+
+hard_df = hard_dict[ORIGINATOR]
+sub_df = hard_df[
+    hard_df["originator"] == ORIGINATOR
+][
+  [
+        "loan_id", "fico", "original_balance", "note_amount", "cur_note_amount", 
+        "dti", "stated_monthly_income", "age", "grade", "purpose", "employment_status",
+        "term", "home_ownership", "state", "defer", "originator"
+  ]
+].reset_index().copy()
+sub_df["current_balance"] = (
+  sub_df["original_balance"] * sub_df["cur_note_amount"]/sub_df["note_amount"]
+)
+sub_df = pd.merge(sub_df, risk_df[["state", "sidx"]], on="state")
+
+fname = "claims.pkl"
+with open(files_dir + fname, "rb") as f:
+    claims_dict = joblib.load(f)
+
+sim_dict = claims_dict["sim_dict"]
+@
+
+<<deferment_data, echo=False>>=
+
+pctile = 50
+defer_df = []
+for v in [omap["LC"], omap["PR"]]:
+    fname = "deferment_pct_" + v  + "_" + str(pctile) + ".pkl"
+    with open(files_dir + fname, 'rb') as f:
+        defer_proj_dict = joblib.load(f)
+        df = defer_proj_dict["defer_df"]
+        defer_df.append(df)
+        
+defer_df = pd.concat(defer_df)
+defer_df = defer_df.reset_index().rename(columns={"index": "sim"})
+defer_df.set_index("sim", inplace=True)
+
+defer_agg_df = defer_df.groupby("sim").agg(
+    defer_dollar=("defer_dollar", np.sum),
+    current_balance=("current_balance", np.sum)
+)
+defer_agg_df["defer_pct"] = defer_agg_df["defer_dollar"]/defer_agg_df["current_balance"]
+
+amort = 0.03
+vcpr = 0.01
+pd_adjust = 1 - (1-amort-vcpr)
+@
+
+\begin{figure}[ht]
+\caption{Cumulative Deferments}
+\label{fig:defer_proj}
+\scalebox{1}{
+<<defer_proj, echo=False>>=
+
+fig, ax = plt.subplots(1, 2, figsize=(10, 5), gridspec_kw={'width_ratios': [4, 6]}, sharex="all")
+
+g = sns.distplot(defer_agg_df.defer_pct, ax=ax[0])
+tot_pctile = np.percentile(defer_agg_df.defer_pct, q=[5, 25, 50, 75, 95])
+ymin, ymax = ax[0].get_ylim()
+xmin, xmax = ax[0].get_xlim()
+ax[0].text(0.95 * (xmin+xmax)/2, 0.8 * ymax,
+  f'Median: {tot_pctile[2]:.2%}\n'
+  f'95% interval: [{tot_pctile[0]:.2%}, {tot_pctile[-1]:.2%}]', alpha=1
+)
+
+ax[0].xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+ax[0].set_xlabel("Deferment Pct.")
+
+median_fstring = []
+confint_fstring = []
+for i, v in enumerate([omap["LC"], omap["PR"]]):
+    df = defer_df[defer_df.originator==v]
+    sns.distplot(df.defer_pct, ax=ax[1], label=v)
+
+    pctile = np.percentile(df.defer_pct, q=[5, 25, 50, 75, 95])
+    median_fstring.append(pctile[2])
+    confint_fstring.append([pctile[0], pctile[-1]])
+
+ax[1].legend(
+  [f'Originator I: {median_fstring[0]:.2%}', 
+  f'Originator II: {median_fstring[-1]:.2%}'], 
+  loc="upper right"
+)
+ax[1].xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+ax[1].set_xlabel("Deferment Pct.")
+    
+plt.tight_layout()
+@
+}
+\end{figure}
+
+The projections start on <%print(f'{asof_date_dict[omap["LC"]].strftime("%B %-d, %Y")}') %> 
+and run to the last full week in the quarter which ends June 27th, 2020. 
+The pool deferment percentage is initialized with loans that are already 
+in deferment and the model simulates the probability of deferment for the remaining
+set. The percentages provided in Figure~\ref{fig:defer_proj} reflect
+the total amounts across both sets. The figures should be interpreted as the percentage
+of the pool, by balance, that is likely to be in deferment status at
+the forecast horizon.
+
+\textbf{Summed across both originators, we expect deferment percentages on this book
+of loans to reach 
+<%print(f'{100*tot_pctile[2]:.2f}') %>\% by the end of June}. 
+The corresponding figures
+for the two originators, broken out separately, are 
+<%print(f'{100*median_fstring[0]:.2f}') %>\% and 
+<%print(f'{100*median_fstring[1]:.2f}') %>\%. Note that these
+simulations assume no paydowns or voluntary prepayments and
+as such inflate the totals. In this particular book of loans,
+paydowns and voluntary prepayments are running at
+the rate of approximately 3\% and 1\% in the month of April. 
+Thus, as a rough adjustment, scaling the figures for 
+total deferments by approximately 
+<%print(f'{(1-pd_adjust):.2f}') %> (for the 4-week period starting
+4 weeks from the projection start date) would
+be appropriate. \textbf{This would adjust the projected deferment percentage
+for the pool as a whole down to <%print(f'{100*(1-pd_adjust)*(tot_pctile[2]):.2f}') %>\%.}
+
+To be clear, these are rough adjustments but as we indicated earlier, 
+the next phase of the modeling will incorporate these projections into
+a more precise cashflow model. In addition, providing the raw estimates
+is a useful benchmark for other sectors with different amortization
+schedules and voluntary prepayment rates.
+
+\section{Conclusion}
+
+Our goals in this report were two-fold. First, we wanted to set out a
+rigorous and transparent statistical framework for analyzing and
+forecasting deferment rates. While the data in the study are from
+the consumer loan sector, the framework established here has
+general applicability to a much broader range of assets. Second,
+we wanted to establish quantitative bounds around what we should
+expect for deferment rates over the next quarter. An important
+derivative work to this report is the development of a cashflow
+engine and valuation model to incorporate these assessments into
+loan pricing. An important aspect to that analysis will be a
+determination of the ``cure'' rate from deferments --- a complicated
+excercse in its own right. For example, Groshen~\cite{groshencovid}
+writes that
+\begin{quote}
+ \emph{
+   \dots 83 percent of the increase in unemployment in March come[\emph{sic}]
+ from workers on temporary furloughs, not permanent layoffs.
+ }
+\end{quote}
+This may be significant in determining whether we are more
+likely to have a speedier recovery rather than a more traditional, drawn out 
+slog from a classical recession. We see hints of this in our data as well ---
+for example, in the vast majority of cases, borrowers have cited ``Curtailment
+of Income'' as the reason for seeking hardship deferments.
+On the other hand, if the nature of the employment
+shock turns into a more permanent layoffs instead of temporary furloughs, the outlook could be
+more dire. \textbf{
+  In terms of rough numbers, the current deferment run rate of 
+30 bps per week, with no cures at deferment expiration, would imply 
+additional annualized default rates (in CDR terms) of 
+<%print(f'{100 * (1-(1-1-(1-0.00300)**4)**12):.2f}')%>\%.}
+
+These aspects need to be explored in greater 
+detail and we leave these considerations for another paper, preferring to 
+deal with our problem in manageable bite-sized chunks. Regardless, the forecasts 
+presented in this report should still serve to provide a lower bound on valuation 
+if one is willing to assume that all borrowers granted deferrals are likely to 
+simply go delinquent when their deferment term expires.
+
+\bibliographystyle{plainnat}
+\bibliography{corona}
+
+\end{document}
