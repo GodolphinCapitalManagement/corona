@@ -1,0 +1,401 @@
+---
+title: "Loan Payment Deferrals Due to COVID-19"
+subtitle: "A Case Study"
+author: [Gyan Sinha]
+date: "2020-06-05"
+keywords: [COVID-19, Deferments, Consumer Loans]
+lang: "en"
+titlepage: true
+titlepage-text-color: "FFFFFF"
+titlepage-rule-color: "360049"
+titlepage-rule-height: 2
+titlepage-background: "background.pdf"
+logo: "godolphin"
+header-includes:
+    - \graphicspath{{/home/gsinha/admin/docs/logos}}
+abstract: "This report analyzes payment deferments or forebearance as a result of
+    COVID-19 related shutdowns in the US. We focus on a
+    portfolio of unsecured consumer loans originated by 2 different
+    institutions. Our analysis focuses on a few key questions: 
+    (1) what is the magnitude of COVID related deferments so far? 
+    (2) can we estimate deferment probabilities and quantify uncertainty bounds around it?
+    (3) does geography impact deferment rates?
+    (4) are there systematic relationships across loans that explain deferment requests?
+    (5) can regional labor market trends explain the probability of loan deferment? 
+    (6) does the sensitivity to labor market shocks vary by region?
+    (7) can we leverage this data to generate longer-term, steady-state  deferment rates based
+    on assumptions about the future path of labor markets?"
+---
+
+
+```python imports, echo=False
+import warnings
+warnings.filterwarnings("ignore")
+import sys
+import datetime
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import seaborn as sns
+sns.set()
+
+plt.rcParams.update({
+    "font.family": "Source Sans Pro",
+    "font.serif": ["Source Sans Pro"], 
+    "font.sans-serif": ["Source Sans Pro"],
+    "font.size": 10,
+})
+
+import joblib
+import numpy as np
+import pandas as pd
+
+import feather
+
+import pymc3 as pm
+import arviz as az
+
+import lifelines
+from lifelines import KaplanMeierFitter, NelsonAalenFitter
+from scipy.special import expit
+
+from analytics import utils
+
+models_dir = "/home/gsinha/admin/db/dev/Python/projects/models/"
+import_dir = models_dir + "defers/"
+sys.path.append(import_dir)
+from common import *
+
+data_dir = models_dir + "data/"
+
+omap = {"LC": "I", "PR": "II"}
+
+ASOF_DATE = datetime.date(2020, 6, 4)
+```
+
+
+## Executive summary
+
+The results presented here are intended to provide a basis for discussion 
+about these questions within a general framework that can
+be applied not only to unsecured consumer loans but also more broadly,
+to other lending sectors. While the data are still  preliminary and the 
+events they capture very recent, our conclusions are based on a rigorous and 
+transparent statistical analysis and are presented with confidence 
+bounds that respect the uncertainty we are currently living through.
+
+In summarizing our results, we would say that larger loans are at greater risk of 
+deferment while higher incomes and more seasoning (the age of the loan) tend 
+to reduce the chance of a deferment. Borrowers who rent and are self-employed
+are at higher risk of deferment. Loans with 5-year amortization terms are
+riskier than those with 3-year terms. All else held equal, the impact of FICO scores
+and DTI ratios is ambiguous - in one case, they tend to decrease the risk while 
+in the other they tend to raise it, albeit by small amounts. On average, 
+a 1 standard-deviation increase in a state's weekly claims (as a percentage of 
+the labor force) implies a roughly 12% increase in deferment probabilities, 
+although this parameter exhibits substantial variation across states.
+Given the current level of deferments and 
+their recent weekly pace (about 30 bps per week, down from a peak of 3%
+to 4% per week in March), we expect deferments to reach []
+
+These forecasts assume cumulative claims of 
+approximately 45 million by the end of the second quarter, from their peak on
+April 4th, 2020. While the ultimate impact on valuation will depend on cure rates
+from deferment, the estimates presented here establish quasi-lower bounds on 
+loan values. **In rough numbers, the current deferment run rate of 
+30 bps per week, with no cures at deferment expiration, would imply 
+additional annualized default rates (in CDR terms) of 
+<%print(f'{100 * (1-(1-1-(1-0.0030)**4)**12):.2f}')%>%.**
+
+```python out_dicts, echo=False
+
+def read_results(model_type, originator, asof_date):
+    ''' read pickled results '''
+
+    import_dir = models_dir + "defers/"
+    fname = (
+        import_dir + "pymc3/originator_" + originator + "/results/" + 
+        "_".join(["defer", originator, model_type, asof_date.isoformat()])
+      )
+    fname += ".pkl"
+
+    with open(fname, "rb") as f:
+        out_dict = joblib.load(f)
+
+    return out_dict
+
+out_dict = {}
+pipe_dict = {}
+scaler_dict = {}
+obs_covars_dict = {}
+hard_df_dict = {}
+
+for i in [omap["LC"], omap["PR"]]:
+    for j in ["pooled", "hier"]:
+        out_dict[":".join([i, j])] = read_results(j, i, ASOF_DATE)
+        
+    orig_model_key = ":".join([i, "hier"])
+    pipe_dict[i] = {
+        "stage_one": out_dict[orig_model_key]["pipe_stage_one"],
+        "stage_two": out_dict[orig_model_key]["pipe_stage_two"],
+        "stage_three": out_dict[orig_model_key]["pipe_stage_three"],
+        "stage_four": out_dict[orig_model_key]["pipe_stage_four"],
+    }
+    scaler_dict[i] = (
+        pipe_dict[i]["stage_two"].named_steps.std_dummy.numeric_transformer.named_steps["scaler"]
+    )
+    obs_covars_dict[i] = out_dict[orig_model_key]["obs_covars"]
+    hard_df_dict[i] = out_dict[orig_model_key]["hard_df"]
+
+risk_df = gen_labor_risk_df(
+    "articles_spreadsheet_extended.xlsx", data_dir
+)
+```
+
+```python pymc_funcs, echo=False
+
+def make_az_data(originator, model_type):
+    ''' make az data instance for originator '''
+
+    orig_model_key = ":".join([originator, "pooled"])
+    model = out_dict[orig_model_key]["model"]
+    trace = out_dict[orig_model_key]["trace"]
+
+    pipe_stage_two = pipe_dict[originator]["stage_two"]
+    pipe_stage_three = pipe_dict[originator]["stage_three"]
+    pipe_stage_four = pipe_dict[originator]["stage_four"]
+  
+    t_covars = pipe_stage_four.named_steps.spline.colnames
+
+    if model_type == "pooled":
+        b_names = ["γ"] + t_covars + pipe_stage_two.named_steps.std_dummy.col_names
+        az_data = az.from_pymc3(trace=trace, model=model, coords={'covars': b_names}, dims={'b': ['covars']})
+        st_out = pd.DataFrame()
+
+        b_out = az.summary(az_data, round_to=3, var_names=["b"])
+        b_out.index = b_names
+    else:
+        state_fips_indexes_df = pipe_stage_three.named_steps.hier_index.grp_0_grp_1_indexes_df
+        index_0_to_st_code_df = state_fips_indexes_df.drop_duplicates(subset=["st_code"])[
+        ["index_0", "st_code"]].set_index("index_0")
+
+        index_0_to_st_code_df = pd.merge(index_0_to_st_code_df, states_df, on="st_code")
+        b_names = pipe_stage_two.named_steps.std_dummy.col_names[:-1]
+        c_names = ["γ"] + t_covars +  ["η"]
+        az_data = az.from_pymc3(
+            trace=trace, model=model, 
+            coords={'obs_covars': b_names, "pop_covars": c_names, 'st_code': index_0_to_st_code_df.state.to_list()},
+            dims={'b': ['obs_covars'], "g_c_μ": ["pop_covars"], "g_c_σ": ["pop_covars"], "st_c_μ": ["st_code"], "st_c_μ_σ": ["st_code"]}
+        )
+        st_out = az.summary(az_data, var_names=["st_c_μ"], round_to=3)
+        st_out_idx = pd.MultiIndex.from_tuples(
+            [(x, y) for x in index_0_to_st_code_df.state.to_list() for y in c_names],
+            names=["state", "param"]
+        )
+        st_out.index = st_out_idx
+
+        b_out = az.summary(az_data, round_to=3, var_names=["b"])
+        b_out.index = b_names
+
+    return trace, az_data, st_out, b_out
+```
+
+```python datasets, echo=False
+hard_df = hard_df_dict[omap["LC"]]
+
+ic_date = pipe_dict[omap["LC"]]["stage_one"].named_steps.add_state_macro_vars.ic_long_df["edate"].max().date()
+
+numeric_features = [
+    "fico", "original_balance", "dti", "stated_monthly_income", "age", "pct_ic"
+]
+categorical_features = [
+    "grade", "purpose", "employment_status", "term", "home_ownership", "is_dq"
+]
+
+knots = np.linspace(0., 15., 7)
+
+data_scaler_dict = {}
+for i in [omap["LC"], omap["PR"]]:
+    for x, y, z in zip(numeric_features, scaler_dict[i].mean_ , scaler_dict[i].scale_):
+        data_scaler_dict[i] = {x:  [y, z]}
+```
+
+## Introduction
+
+Our reasons for undertaking this research project were driven by
+practical considerations --- like many other investors in consumer and
+mortgage lending, we happen to be long these loans. As such, it is
+critical for us to evaluate future losses and prospective returns on
+these loans and make assessments about their ``fundamental'' value.
+We do this with the explicit recognition of the unprecedented nature
+of the COVID shock and the fact that in many ways, we are sailing
+through uncharted waters.
+
+A natural question that may arise here is the applicability of the analysis
+presented given its narrow focus. While there is a natural
+tendency to always seek out more and greater amounts of data, in
+practice, investors in most cases, hold narrow subsets of the overall population of
+loans. While larger datasets may give us more precise estimates (up to
+a point), the fact is that we want to make statements about OUR
+portfolio, not a fictional universe which is not owned by anyone in
+particular. The challenge then is to employ statistical methods that
+allow us to extract information from "small" not "big" data and
+turn these into useful insights for decision-making. This is where the
+bayesian methods we deploy in this report come in useful since they
+explicitly deal with inferential uncertainty in an intrinsic way and
+can be used to provide insights in other contexts as well.
+
+There are 3 parts to our project. First, we tackle the analysis by
+describing the data set in some detail and present
+stratifications of the data by different loan attributes. We also
+present the deferment rates within each strata in order to get
+intuition around the impact of loan attributes. We then
+provide statistics around the labor markets in various states. We look
+at the impact of initial claims, starting March 14th (which we peg as
+the start of the COVID crisis for our purposes) and through the week
+ending <%print(f'{ic_date.strftime("%B %-d, %Y")}')%>, as a percent
+of the total employment in each state at the beginning of March. 
+An open question that the modeling seeks to answer is the impact of the
+claims variables on deferment rates and whether these can be leveraged into a 
+prediction framework going forward. A discussion of the statistical model 
+that relates the observed outcome (did the loan defer: Yes/No?) to the 
+various loan attributes is provided next. The framework employed is based on 
+Survival Analysis, using a hierarchical bayes approach as
+in \cite{8328358dab6746d884ee538c687aa0dd} and \cite{doi:10.1198/004017005000000661}. 
+In closing this part, we
+present and discuss the results across the two institutions,
+highlighting any differences in the impact of attributes that emerge.
+
+In the second part of our work, we develop a methodology for
+forecasting the path of initial claims at the national and state
+levels over the next few months. This analysis is unique in its own
+way and leverages a brief descriptive note put out by Federal Reserve
+Bank of NY researchers in a blog article. We use the claims forecast
+as inputs into the predictions for deferment rates at the end of
+second quarter of 2020, which is our forecast horizon.
+
+The third part of the project applies the deferment forecasts
+developed in the first and second parts to predict deferment
+rates at the end of the second quarter. The methodology is 
+simple --- we take as given the set of loans that are already
+in deferment and project the share of loans that are likely
+to be in deferment roughly 8 weeks out. The combined total
+gives us the answer we are looking for.
+
+Before we dive into the details, there are 3 key technical aspects in
+this report that are worth highlighting.  First, the use of survival or
+hazard models to estimate the marginal deferment probability, as a
+function of weeks elapsed since the crisis is key to sensible
+projections of deferment \footnote{This is a benefit over and above
+the intrinsic gain from using this framework in the context of 
+"censored" data where most of the observations have not yet 
+experienced a deferment event}. As we show, these marginal
+hazards have a very strong "duration" component which impacts
+longer-term forecasts of the cumulative amount of deferments we expect
+over the next few months. 
+
+Second, we extend the survival model
+framework by incorporating parameter hierarchies (within a bayesian
+framework) that explicitly account for random variation in the impact
+of variables, across state clusters. This allows for the 
+possibility of ``unobserved heterogeneity'' in the data by
+explicitly modeling a state-specific random variable that interacts
+with and modifies the hazards for loan clusters within a state. This 
+is an important enhancement since (i) there may be
+differences in the composition of the workforce across states that
+affects the way in which a given volume of claims affects deferment
+rates, and (ii) the borrower base itself may differ across states in both
+observable and unobservable ways. We control for the observed
+attributes explicitly but the hierarchical framework allows us to
+model unobserved factors as well. 
+
+Third, we develop a statistical framework 
+to model ``decay'' rates for weekly claims and the role that labor markets 
+play in determining deferment rates, building upon ideas first discussed 
+by researchers at the NY Fed. The projections from this framework serve as 
+inputs to our longer-term deferment forecasts and allows us to model the 
+impact of different economic scenarios in the future, an important tool to have
+in the arsenal given the considerable uncertainties that still remain
+regarding the future path of the economy.
+
+## Data
+In Table~\ref{tbl:portfolio_summary}, we provided an overview of our 
+data sample. In all, we have <%print(f'{hard_df.shape[0]}')%> loans
+in our data, in roughly a 50/50 split (by count) across the 2 institutions.
+
+
+\label{tbl:portfolio_summary}
+```python portfolio_summary, echo=False, caption="Portfolio Summary", results="tex"
+
+hard_df["current_balance"] = (
+  hard_df["original_balance"] * hard_df["cur_note_amount"]/hard_df["note_amount"]
+)
+hard_df["defer_dollar"] = hard_df["defer"] * hard_df["current_balance"]
+
+def wavg(x):
+    return np.average(
+        x, weights=hard_df.loc[x.index, "current_balance"]
+    )
+
+aaa = hard_df.groupby(["originator", "grade"]).agg(
+    n=('loan_id', "count"),
+    original_balance=('original_balance', sum),
+    current_balance=('current_balance', sum),
+    wac=('original_rate', wavg),
+    age=('age', wavg),
+    fico=('fico', wavg),
+    term=('original_term', wavg),
+    defer=('defer', wavg),
+)
+
+bbb = hard_df.groupby(["originator"]).agg(
+    n=('loan_id', "count"),
+    original_balance=('original_balance', sum),
+    current_balance=('current_balance', sum),
+    wac=('original_rate', wavg),
+    age=('age', wavg),
+    fico=('fico', wavg),
+    term=('original_term', wavg),
+    defer=('defer', wavg),
+)
+
+bbb.index = pd.MultiIndex.from_tuples(
+    [(omap["LC"], 'ALL'), (omap["PR"], 'ALL')], names=['originator', 'grade']
+)
+
+aaa = pd.concat([aaa, bbb])
+
+ccc = pd.concat(
+    [
+        pd.Series(hard_df["loan_id"].apply("count"), name="n"),
+        pd.Series(hard_df["original_balance"].sum(), name="original_balance"),
+        pd.Series(hard_df["current_balance"].sum(), name="current_balance"),
+        hard_df[["original_rate", "age", "fico", "original_term"]].apply(wavg).to_frame().T.rename(
+            columns={"original_term": "term", "original_rate": "wac"}),
+        pd.Series(wavg(hard_df["defer"]), name="defer"),
+    ], axis=1
+)
+ccc.index = [('ALL', 'ALL')]
+
+ddd = pd.concat([aaa, ccc])
+ddd["pct"] = ddd["current_balance"]/ddd.loc[pd.IndexSlice["ALL", "ALL"],  "current_balance"]
+ddd.index.names = ["Originator", "Grade"]
+
+cfmt = "".join(["r"] * (ddd.shape[1] + 2))
+header = [
+  "N", "Orig. Bal.", "Cur. Bal.", "WAC", "WALA", "FICO", 
+  "WAOT", "Defer", "Share",
+]
+tbl_fmt = {
+  "original_balance": utils.dollar,
+  "current_balance": utils.dollar,
+  "n": utils.integer, "fico": utils.number,
+  "term": utils.number, "age": utils.number,
+  "pct": utils.percent, "defer": utils.percent,
+  "wac": utils.percent
+}
+
+print(ddd.to_markdown())
+
+one_line = ddd.loc[pd.IndexSlice["ALL", :], :]
+```

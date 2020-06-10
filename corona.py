@@ -16,122 +16,197 @@ plt.rcParams.update({
     "font.size": 10,
 })
 
+import pathlib
 import joblib
 import numpy as np
 import pandas as pd
+import geopandas as gpd
+import pytoml
+
+from fredapi import Fred
 
 import feather
 
 import pymc3 as pm
 import arviz as az
 
+import lifelines
+from lifelines import KaplanMeierFitter, NelsonAalenFitter
 from scipy.special import expit
 
 from analytics import utils
 
-files_dir = "/home/gsinha/admin/db/dev/Python/projects/scripts/misc/"
-sys.path.append(files_dir)
-import common
+models_dir = "/home/gsinha/admin/db/dev/Python/projects/models/"
+import_dir = models_dir + "defers/"
+sys.path.append(import_dir)
+from common import *
 
-pymc3_dict = {}
+data_dir = models_dir + "data/"
+
+omap = {"LC": "I", "PR": "II"}
+
+results_dir = {
+  "LC": models_dir + "defers/pymc3/" + "originator_" + omap["LC"] + "/",
+  "PR": models_dir + "defers/pymc3/" + "originator_" + omap["PR"] + "/"
+}
+
+idx = pd.IndexSlice
+
+ASOF_DATE = datetime.date(2020, 6, 8)
+
+fname = data_dir + "claims.pkl"
+with open(fname, "rb") as f:
+    claims_dict = joblib.load(f)
+
+
+def read_results(model_type, originator, asof_date):
+    ''' read pickled results '''
+
+    import_dir = models_dir + "defers/"
+    fname = (
+        import_dir + "pymc3/originator_" + originator + "/results/" + 
+        "_".join(["defer", originator, model_type, asof_date.isoformat()])
+      )
+    fname += ".pkl"
+
+    with open(fname, "rb") as f:
+        out_dict = joblib.load(f)
+
+    return out_dict
+
+out_dict = {}
+pipe_dict = {}
+scaler_dict = {}
+obs_covars_dict = {}
+hard_df_dict = {}
+test_dict = {}
+
+for i in [omap["LC"], omap["PR"]]:
+    for j in ["pooled", "hier"]:
+        out_dict[":".join([i, j])] = read_results(j, i, ASOF_DATE)
+        
+    orig_model_key = ":".join([i, "hier"])
+    pipe_dict[i] = {
+        "stage_one": out_dict[orig_model_key]["pipe"]["p_s_1"],
+        "stage_two": out_dict[orig_model_key]["pipe"]["p_s_2"],
+        "stage_three": out_dict[orig_model_key]["pipe"]["p_s_3"],
+        "stage_four": out_dict[orig_model_key]["pipe"]["p_s_4"],
+    }
+    scaler_dict[i] = (
+        pipe_dict[i]["stage_two"].named_steps.std_dummy.numeric_transformer.named_steps["scaler"]
+    )
+    obs_covars_dict[i] = out_dict[orig_model_key]["obs_covars"]
+    hard_df_dict[i] = out_dict[orig_model_key]["hard_df"]
+    test_dict[i] = out_dict[orig_model_key]["test"]
+
+risk_df = gen_labor_risk_df(
+    "articles_spreadsheet_extended.xlsx", data_dir
+)
+
+
+def make_az_data(originator, model_type):
+    ''' make az data instance for originator '''
+
+    orig_model_key = ":".join([originator, model_type])
+    model = out_dict[orig_model_key]["model"]
+    trace = out_dict[orig_model_key]["trace"]
+
+    pipe_stage_two = pipe_dict[originator]["stage_two"]
+    pipe_stage_three = pipe_dict[originator]["stage_three"]
+    pipe_stage_four = pipe_dict[originator]["stage_four"]
+  
+    t_covars = pipe_stage_four.named_steps.spline.colnames
+
+    if model_type == "pooled":
+        b_names = ["γ"] + t_covars + pipe_stage_two.named_steps.std_dummy.col_names
+        az_data = az.from_pymc3(trace=trace, model=model, coords={'covars': b_names}, dims={'b': ['covars']})
+        st_out = pd.DataFrame()
+
+        b_out = az.summary(az_data, round_to=3, var_names=["b"])
+        b_out.index = b_names
+    else:
+        state_fips_indexes_df = pipe_stage_three.named_steps.hier_index.grp_0_grp_1_indexes_df
+        index_0_to_st_code_df = state_fips_indexes_df.drop_duplicates(subset=["st_code"])[
+        ["index_0", "st_code"]].set_index("index_0")
+
+        index_0_to_st_code_df = pd.merge(index_0_to_st_code_df, states_df, on="st_code")
+        b_names = pipe_stage_two.named_steps.std_dummy.col_names[:-1]
+        c_names = ["γ"] + t_covars +  ["η"]
+        az_data = az.from_pymc3(
+            trace=trace, model=model, 
+            coords={'obs_covars': b_names, "pop_covars": c_names, 'st_code': index_0_to_st_code_df.state.to_list()},
+            dims={'b': ['obs_covars'], "g_c_μ": ["pop_covars"], "g_c_σ": ["pop_covars"], "st_c_μ": ["st_code"], "st_c_μ_σ": ["st_code"]}
+        )
+        st_out = az.summary(az_data, var_names=["st_c_μ"], round_to=3)
+        st_out_idx = pd.MultiIndex.from_tuples(
+            [(x, y) for x in index_0_to_st_code_df.state.to_list() for y in c_names],
+            names=["state", "param"]
+        )
+        st_out.index = st_out_idx
+
+        b_out = az.summary(az_data, round_to=3, var_names=["b"])
+        b_out.index = b_names
+
+    return trace, az_data, st_out, b_out
+
+# just need one issuer for the combined data
+hard_df = hard_df_dict[omap["LC"]]
+
+ic_date = (
+  pipe_dict[omap["LC"]]["stage_one"].named_steps.add_state_macro_vars.ic_long_df["edate"].max().date()
+)
+
+numeric_features = [
+    "fico", "original_balance", "dti", "stated_monthly_income", "age", "pct_ic"
+]
+categorical_features = [
+    "grade", "purpose", "employment_status", "term", "home_ownership", "is_dq"
+]
+
+knots = np.linspace(0., 15., 7)
+
 data_scaler_dict = {}
-risk_scaler_dict = {}
+for i in [omap["LC"], omap["PR"]]:
+    data_scaler_dict[i] = {
+        "mu" : dict(zip(numeric_features, scaler_dict[i].mean_)),
+        "sd":  dict(zip(numeric_features, scaler_dict[i].scale_))  
+    }
 
-data_dict = {}
-hard_dict = {}
-risk_dict = {}
 
-X_dict = {}
-X_risk_dict = {}
-
-asof_date_dict = {}
-ic_date_dict = {}
-
-cat_vars_dict = {}
-cat_var_names_dict = {}
-
-for i in ["LC", "PR"]:
-  fname = files_dir + "hierarchical_r_" + i + ".pkl"
-  with open(fname, "rb") as f:
-    pymc3_dict[i] = joblib.load(f)
-
-    data_scaler_dict[i] = pymc3_dict[i]["data_scaler"]
-    risk_scaler_dict[i] = pymc3_dict[i]["risk_scaler"]
-    data_dict[i] = pymc3_dict[i]["data_df"]
-    hard_dict[i] = pymc3_dict[i]["hard_df"]
-    risk_dict[i] = pymc3_dict[i]["risk_df"]
-    X_dict[i] = pymc3_dict[i]["X"]
-    X_risk_dict[i] = pymc3_dict[i]["X_risk"]
-
-    # PARAMS
-    asof_date_dict[i] =  pymc3_dict[i]["asof_date"]
-    ic_date_dict[i] =  pymc3_dict[i]["ic_date"]
-
-    cat_vars_dict[i] = pymc3_dict[i]["cat_vars"]
-    cat_var_names_dict[i] = pymc3_dict[i]["cat_var_names"]
-
-with open(files_dir + "risk_df.feather", "rb") as f:
-  risk_df = feather.read_dataframe(f)
-
-def make_az_data(originator, pymc3_dict, X, X_risk, risk_df):
-  ''' make az data instance for originator '''
-
-  hier_model = pymc3_dict[originator]["model"]
-  hier_trace = pymc3_dict[originator]["trace"]
-
-  with hier_model:
-    ppc = pm.sample_posterior_predictive(hier_trace, progressbar=False)
-
-  az_data = az.from_pymc3(
-      trace=hier_trace,
-      posterior_predictive=ppc,
-      model=hier_model,
-      coords={
-          'covars': X.columns.to_list(),
-          'states': risk_df.state.to_list(),
-          'beta': X_risk.columns.to_list(),
-          "Δ": ["Δ_" + x for x in risk_df.state.to_list()]
-      },
-      dims={
-        'a': ["states"], "α": ["states"], "β": ["beta"], 'Δ_a': ["Δ"],
-        'b': ['covars']
-      }
-  )
-
-  return az_data, hier_model, hier_trace, ppc
-
-df = []
-for i in ["PR", "LC"]:
-    df.append(data_dict[i])
-hard_df = pd.concat(df, sort=False, ignore_index=True)
+hard_df["current_balance"] = (
+  hard_df["original_balance"] * hard_df["cur_note_amount"]/hard_df["note_amount"]
+)
+hard_df["defer_dollar"] = hard_df["defer"] * hard_df["current_balance"]
 
 def wavg(x):
     return np.average(
-        x, weights=hard_df.loc[x.index, "original_balance"]
+        x, weights=hard_df.loc[x.index, "current_balance"]
     )
 
 aaa = hard_df.groupby(["originator", "grade"]).agg(
     n=('loan_id', "count"),
     original_balance=('original_balance', sum),
+    current_balance=('current_balance', sum),
     wac=('original_rate', wavg),
     age=('age', wavg),
     fico=('fico', wavg),
     term=('original_term', wavg),
-    defer=('defer', np.mean)
+    defer=('defer', wavg),
 )
 
 bbb = hard_df.groupby(["originator"]).agg(
     n=('loan_id', "count"),
     original_balance=('original_balance', sum),
+    current_balance=('current_balance', sum),
     wac=('original_rate', wavg),
     age=('age', wavg),
     fico=('fico', wavg),
     term=('original_term', wavg),
-    defer=('defer', np.mean)
+    defer=('defer', wavg),
 )
 
 bbb.index = pd.MultiIndex.from_tuples(
-    [('LC', 'ALL'), ('PR', 'ALL')], names=['originator', 'grade']
+    [(omap["LC"], 'ALL'), (omap["PR"], 'ALL')], names=['originator', 'grade']
 )
 
 aaa = pd.concat([aaa, bbb])
@@ -140,57 +215,77 @@ ccc = pd.concat(
     [
         pd.Series(hard_df["loan_id"].apply("count"), name="n"),
         pd.Series(hard_df["original_balance"].sum(), name="original_balance"),
+        pd.Series(hard_df["current_balance"].sum(), name="current_balance"),
         hard_df[["original_rate", "age", "fico", "original_term"]].apply(wavg).to_frame().T.rename(
             columns={"original_term": "term", "original_rate": "wac"}),
-        pd.Series(hard_df["defer"].mean(), name="defer")
+        pd.Series(wavg(hard_df["defer"]), name="defer"),
     ], axis=1
 )
 ccc.index = [('ALL', 'ALL')]
 
 ddd = pd.concat([aaa, ccc])
-ddd["pct"] = ddd["original_balance"]/ddd.loc[pd.IndexSlice["ALL", "ALL"],  "original_balance"]
+ddd["pct"] = ddd["current_balance"]/ddd.loc[pd.IndexSlice["ALL", "ALL"],  "current_balance"]
 ddd.index.names = ["Originator", "Grade"]
+
 cfmt = "".join(["r"] * (ddd.shape[1] + 2))
+header = [
+  "N", "Orig. Bal.", "Cur. Bal.", "WAC", "WALA", "FICO", 
+  "WAOT", "Defer", "Share",
+]
+tbl_fmt = {
+  "original_balance": utils.dollar,
+  "current_balance": utils.dollar,
+  "n": utils.integer, "fico": utils.number,
+  "term": utils.number, "age": utils.number,
+  "pct": utils.percent, "defer": utils.percent,
+  "wac": utils.percent
+}
+
 print(
     ddd.to_latex(
       index=True, multirow=True, 
-      header=["N", "Balance", "WAC", "WALA", "FICO", "WAOT", "Defer", "Share"],
-      bold_rows=True,
-      formatters={
-        "original_balance": utils.dollar,
-        "n": utils.integer, "fico": utils.number,
-        "term": utils.number, "age": utils.number,
-        "pct": utils.percent, "defer": utils.percent,
-        "wac": utils.percent
-      },
+      header=header,
+      
+      formatters=tbl_fmt,
       column_format=cfmt,
       multicolumn_format="r",
     ))
 
 one_line = ddd.loc[pd.IndexSlice["ALL", :], :]
 
-purpose_tbl = common.summary_by_group(
+pos = []
+for i in [omap["LC"], omap["PR"]]:
+    pos.append(get_due_day(i, ASOF_DATE))
+pos_df = pd.concat(pos, ignore_index=True)
+pos_df = pos_df[pos_df["loan_id"].isin(hard_df["loan_id"].to_list())]
+
+fig, ax = plt.subplots(2, 1, figsize=(10, 5), sharey=True)
+for i, v in enumerate([omap["LC"], omap["PR"]]):
+    df = pos_df[pos_df["originator"] == v]
+    ax[i].hist(df.pmt_day)
+    ax[i].set_xlabel("Due day")
+    ax[i].set_ylabel("Frequency")
+    ax[i].set_title(f"Originator: {v}")
+    
+plt.tight_layout()
+
+purpose_tbl = summary_by_group(
     ["originator", "purpose"], hard_df
 )
 purpose_tbl.index.names = ["Originator", "Purpose"]
 cfmt = "".join(["r"] * (purpose_tbl.shape[1] + 2))
+
 print(
     purpose_tbl.to_latex(
       index=True, multirow=True, 
-      header=["N", "Balance", "WAC", "WALA", "FICO", "WAM", "Defer", "Share"],
-      bold_rows=True,
-      formatters={
-        "original_balance": utils.dollar,
-        "n": utils.integer, "fico": utils.number,
-        "term": utils.number, "age": utils.number,
-        "pct": utils.percent, "defer": utils.percent,
-        "wac": utils.percent
-      },
+      header=header,
+      
+      formatters=tbl_fmt,
       column_format=cfmt,
       multicolumn_format="r",
     ))
 
-emp_tbl = common.summary_by_group(
+emp_tbl = summary_by_group(
     ["originator", "employment_status"], hard_df
 )
 emp_tbl = emp_tbl.fillna(0)
@@ -199,20 +294,14 @@ cfmt = "".join(["r"] * (emp_tbl.shape[1] + 2))
 print(
     emp_tbl.to_latex(
       index=True, multirow=True, 
-      header=["N", "Balance", "WAC", "WALA", "FICO", "WAM", "Defer", "Share"],
-      bold_rows=True,
-      formatters={
-        "original_balance": utils.dollar,
-        "n": utils.integer, "fico": utils.number,
-        "term": utils.number, "age": utils.number,
-        "pct": utils.percent, "defer": utils.percent,
-        "wac": utils.percent
-      },
+      header=header,
+      
+      formatters=tbl_fmt,
       column_format=cfmt,
       multicolumn_format="r",
     ))
 
-homeowner_tbl = common.summary_by_group(
+homeowner_tbl = summary_by_group(
     ["originator", "home_ownership"], hard_df
 )
 homeowner_tbl.index.names = ["Originator", "Homeownership"]
@@ -220,20 +309,14 @@ cfmt = "".join(["r"] * (homeowner_tbl.shape[1] + 2))
 print(
     homeowner_tbl.to_latex(
       index=True, multirow=True, 
-      header=["N", "Balance", "WAC", "WALA", "FICO", "WAM", "Defer", "Share"],
-      bold_rows=True,
-      formatters={
-        "original_balance": utils.dollar,
-        "n": utils.integer, "fico": utils.number,
-        "term": utils.number, "age": utils.number,
-        "pct": utils.percent, "defer": utils.percent,
-        "wac": utils.percent
-      },
+      header=header,
+      
+      formatters=tbl_fmt,
       column_format=cfmt,
       multicolumn_format="r",
     ))
 
-term_tbl = common.summary_by_group(
+term_tbl = summary_by_group(
     ["originator", "original_term"], hard_df
 )
 term_tbl.index.names = ["Originator", "Term"]
@@ -241,20 +324,14 @@ cfmt = "".join(["r"] * (term_tbl.shape[1] + 2))
 print(
     term_tbl.to_latex(
       index=True, multirow=True, 
-      header=["N", "Balance", "WAC", "WALA", "FICO", "WAM", "Defer", "Share"],
-      bold_rows=True,
-      formatters={
-        "original_balance": utils.dollar,
-        "n": utils.integer, "fico": utils.number,
-        "term": utils.number, "age": utils.number,
-        "pct": utils.percent, "defer": utils.percent,
-        "wac": utils.percent
-      },
+      header=header,
+      
+      formatters=tbl_fmt,
       column_format=cfmt,
       multicolumn_format="r",
     ))
 
-dq_tbl = common.summary_by_group(
+dq_tbl = summary_by_group(
     ["originator", "dq_grp"], hard_df
 )
 dq_tbl.index.names = ["Originator", "DQ Status"]
@@ -262,219 +339,274 @@ cfmt = "".join(["r"] * (dq_tbl.shape[1] + 2))
 print(
     dq_tbl.to_latex(
       index=True, multirow=True, 
-      header=["N", "Balance", "WAC", "WALA", "FICO", "WAM", "Defer", "Share"],
-      bold_rows=True,
-      formatters={
-        "original_balance": utils.dollar,
-        "n": utils.integer, "fico": utils.number,
-        "term": utils.number, "age": utils.number,
-        "pct": utils.percent, "defer": utils.percent,
-        "wac": utils.percent
-      },
+      header=header,
+      
+      formatters=tbl_fmt,
       column_format=cfmt,
       multicolumn_format="r",
     ))
 
-fig, ax = plt.subplots(1, 1, figsize=(10, 5))
-sns.barplot(data=risk_dict["LC"], x="state", y="pct_low_risk_s", ax=ax)
-ax.set_ylabel("Low-risk employment share: Z-Score")
-ax.set_xlabel("State")
-plt.xticks(rotation=45, fontsize=8)
-_ = sns.despine()
 
-zzz = pm.model_to_graphviz(pymc3_dict["PR"]["model"])
-_ = zzz.render(
-  directory="figures",
-  filename="pr_hier_model", format="png",
-  cleanup=True
-)
+stage_one_df = pipe_dict[omap["LC"]]["stage_one"].fit_transform(hard_df)
+
+fig, ax = plt.subplots(2, 1, figsize=(8, 6.4))
+
+sns.boxplot(stage_one_df.sdate.dt.date, stage_one_df.pct_ic, ax=ax[0])
+sns.distplot(stage_one_df.pct_ic, ax=ax[1], kde=False)
+
+ax[0].set_xlabel("Week ending: "); 
+ax[0].set_ylabel("Weekly claims/Labor Force")
+ax[1].set_xlabel("Weekly claims/Labor Force")
+ax[0].yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+ax[1].xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+
+ax[0].set_xticklabels(ax[0].get_xticklabels(), rotation=45, ha='right')
+
+plt.tight_layout()
+
+def plot_defer_hazard_by_state(originator):
+  ''' plots deferment hazards by state and week '''
+  zzz = pipe_dict[originator]["stage_one"].fit_transform(hard_df)
+  zzz.reset_index(inplace=True)
+
+  a_df = zzz.groupby(["state"]).agg(
+    n=("loan_id", "count"), k=("defer", np.sum), defer=("defer", np.mean),
+    pct_ic=("pct_ic", np.mean)
+  ).reset_index()
+
+  g = sns.FacetGrid(
+    data=a_df.reset_index(),
+  )
+  g.map(sns.regplot, "pct_ic", "defer", ci=True)
+  g.ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+  g.ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+
+  # add annotations one by one with a loop
+  for line in range(0, a_df.shape[0]):
+    g.ax.text(
+      a_df["pct_ic"][line]+0.001, a_df["defer"][line], a_df["state"][line], 
+      horizontalalignment='left', size='medium', color='red', 
+      weight='semibold', alpha=0.25
+    )
+
+  g.ax.figure.set_size_inches(15, 8)
+  g.ax.set_xlabel("Weekly claims/March Employment")
+  g.ax.set_ylabel("Deferment hazard")
+
+  return g
+
+g = plot_defer_hazard_by_state(omap["LC"])
+sns.despine(left=True)
+
+g = plot_defer_hazard_by_state(omap["PR"])
+sns.despine(left=True)
 
 def create_state_aggs(originator, hard_df, risk_df):
     ''' pct deferment vs pct low risk '''
     
     xbar_df = hard_df.groupby(["originator", "state"]).agg(
-        n=("loan_id", "count"),
-        k=('defer', np.sum),
-        pct=('defer', np.mean),
-        balance=('cur_note_amount', sum)
+      n=("loan_id", "count"), k=('defer', np.sum),
+      pct=('defer', np.mean), balance=('cur_note_amount', sum)
     ).loc[pd.IndexSlice[originator, :], :].droplevel(0).reset_index()
     
     xbar_df = pd.merge(xbar_df, risk_df, on="state")
     
     return xbar_df
 
-def defer_prob(df, hier_trace):
-    ''' deferment plots actual vs hierarchical '''
+
+T = hard_df.dur
+E = hard_df.defer
+
+bandwidth = 1
+naf = NelsonAalenFitter()
+lc = hard_df["originator"].isin([omap["LC"]])
+
+naf.fit(T[lc],event_observed=E[lc], label="Originator I")
+ax = naf.plot_hazard(bandwidth=bandwidth, figsize=(10, 5))
+
+naf.fit(T[~lc], event_observed=E[~lc], label="Originator II")
+naf.plot_hazard(ax=ax, bandwidth=bandwidth)
+
+ax.set_xlabel("Weeks since March 14th, 2020")
+ax.set_ylabel("Weekly hazard")
+
+_  = plt.xlim(0, hard_df.dur.max() + 1)
+
+lt_df = lifelines.utils.survival_table_from_events(
+    hard_df.dur, 
+    hard_df.defer, collapse=True
+)
+print(lt_df.to_latex(column_format='rrrrr'))
+
+
+def make_ppc_plot(originator):
+    ''' make ppc plot '''
     
-    data_df = df.copy()
-    
-    data_df = pd.concat(
-        [
-            data_df,
-            pd.Series(hier_trace["xbeta"].mean(axis=0), name="μ_xbeta"),
-            pd.Series(hier_trace["xbeta"].std(axis=0), name="σ_xbeta")
-        ], axis=1
+    orig_model_key = ":".join([originator, "hier"])
+    ppc, s_1_df, _ = simulate(
+        test_dict[originator], claims_dict["chg_df"], originator,
+        ASOF_DATE, out_dict[orig_model_key]
     )
     
-    data_df["h_mean"] = common.invcloglog(data_df["μ_xbeta"])
-    data_df["h_lo"] = common.invcloglog(data_df["μ_xbeta"] - data_df["σ_xbeta"])
-    data_df["h_hi"] = common.invcloglog(data_df["μ_xbeta"] + data_df["σ_xbeta"])
-    
-    F_df = pd.merge(
-        (1 - np.exp(-data_df.groupby("loan_id")[["h_mean"]].sum())).rename(columns={"h_mean": "F_mean"}).reset_index(),
-        (1 - np.exp(-data_df.groupby("loan_id")[["h_lo"]].sum())).rename(columns={"h_lo": "F_lo"}).reset_index(),
-        on="loan_id"
-    ).merge(
-        (1 - np.exp(-data_df.groupby("loan_id")[["h_hi"]].sum())).rename(columns={"h_hi": "F_hi"}).reset_index(),
-        on="loan_id"
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    ax.hist(ppc.mean(axis=0), bins=19, alpha=0.5)
+    ax.axvline(s_1_df["defer"].mean())
+
+    ax.set(xlabel='Deferment hazard.', ylabel='Frequency')
+  
+    pctile = np.percentile(ppc.mean(axis=0), q=[5, 95])
+    ax.axvline(pctile[0], color="red", linestyle=":")
+    ax.axvline(pctile[1], color="red", linestyle=":")
+
+    _ = ax.text(
+      1.65 * s_1_df["defer"].mean(), 0.85 * ax.get_ylim()[1], 
+      f'95% HPD: [{pctile[0]:.3f}, {pctile[1]:.3f}]'
     )
-    
-    data_df = pd.merge(data_df, F_df, on="loan_id", how="left")
-    data_df.drop_duplicates(subset=["loan_id"], keep="last", inplace=True)
-    data_df = data_df.groupby("state").agg(
-        F_mean=('F_mean', np.mean),
-        F_lo=('F_lo', np.mean),
-        F_hi=('F_hi', np.mean)
-    ).reset_index()
-        
-    return data_df
 
-#
-originator = "LC"
-X = X_dict[originator]
-X_risk = X_risk_dict[originator]
-risk_df = risk_dict[originator]
-data_df = data_dict[originator]
-
-az_data, hier_model, hier_trace, ppc = make_az_data(
-  originator, pymc3_dict, X, X_risk, risk_df
-)
+    return fig
 
 
-_, ax = plt.subplots(figsize=(10, 5))
-y_hat = np.array([x.mean() for x in ppc['yobs']])
-
-ax.hist(y_hat, bins=19, alpha=0.5)
-ax.axvline(data_df["defer"].mean())
-ax.set(xlabel='Deferment Pct.', ylabel='Frequency')
-ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
-
-pctile = np.percentile([x.mean() for x in ppc['yobs']], q=[5, 95])
-_ = ax.text(0.016, 1100, f'95% HPD: [{pctile[0]:.2%}, {pctile[1]:.2%}]')
-
-β_out = az.summary(az_data, var_names=['β'],round_to=3)
-β_out.index = X_risk.columns.to_list()
-print(β_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]].to_latex(
-  index=True, column_format="rrrrrr"
+pooled_trace, pooled_data, _, pooled_b_out = make_az_data(omap["LC"], "pooled")
+print(
+  pooled_b_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]].to_latex(
+     column_format="rrrrrr"
   )
 )
 
+fig = make_ppc_plot(omap["LC"])
+fig.show()
 
-state_agg_df = create_state_aggs(originator, hard_df, risk_df)
-defer_df = defer_prob(data_df, hier_trace)
-
-xbar_df = pd.merge(state_agg_df, defer_df, on="state")
-xbar_df.sort_values(by=["pct"], inplace=True)
-print(state_agg_df.tail())
-
-# plot 
-fig, ax = plt.subplots(1, 1, figsize=(18, 12))
-x = np.arange(xbar_df.index.max()+1)
-
-ax.plot(x, xbar_df.F_mean, color="green", label="Bayes-shrinkage survivor", linestyle="--")
-ax.scatter(x, xbar_df.pct, color="red", label="Naive MLE", alpha=0.5)
-ax.fill_between(
-    x, xbar_df.F_lo, xbar_df.F_hi, alpha=0.25, color='C1'
+hier_trace, hier_data, lc_hier_st_out, lc_hier_b_out = make_az_data(
+  omap["LC"], "hier"
+)
+dff_η = lc_hier_st_out.loc[idx[:, "η"], "mean"].droplevel(level=1).reset_index().rename(
+    columns={"mean": "value"}
 )
 
-ax.set_xlabel("State")
-ax.set_ylabel(f'Deferment Pct.: Week {data_df["stop"].astype(int).max()-1}')
-ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
-plt.xticks(x)
-ax.set_xticklabels(xbar_df.state, rotation=45, size=12)
-plt.legend(loc="upper left")
-sns.despine(left=True)
+us_states = gpd.read_file(
+  "https://www2.census.gov/geo/tiger/GENZ2018/shp/cb_2018_us_state_20m.zip"
+)
+merged_us_states_η = pd.merge(
+  us_states, dff_η, left_on="STUSPS", right_on="state", how="right")
 
-b_out = az.summary(az_data, var_names=['b'], round_to=3)
-b_out["odds"] = np.exp(b_out["mean"])
-b_out.index = X.columns.to_list()
-print(b_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat", "odds"]].to_latex(
-  index=True, column_format="rrrrrrr", formatters={
-    "odds": utils.number
-  },
+fig, ax = plt.subplots(1, figsize=(15, 18))
+albers_epsg = 2163
+ax = us_states[~us_states["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg).plot(
+    ax=ax, linewidth=0.25, edgecolor='white', color='grey'
+)
+
+ax = merged_us_states_η[~merged_us_states_η["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg).plot(
+    column='value', ax=ax, cmap='viridis', scheme="quantiles",  legend=True, 
+    legend_kwds={"loc": "upper center", "ncol": 3}
+)
+_ = ax.axis('off');
+
+
+dff_γ = lc_hier_st_out.loc[idx[:, "γ"], :].droplevel(level=1).reset_index().rename(
+    columns={"mean": "value"}
+)
+
+merged_us_states_γ = pd.merge(
+  us_states, dff_γ, left_on="STUSPS", right_on="state", how="right"
+)
+
+fig, ax = plt.subplots(1, figsize=(15, 18))
+albers_epsg = 2163
+ax = us_states[~us_states["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg).plot(
+    ax=ax, linewidth=0.25, edgecolor='white', color='grey'
+)
+
+ax = merged_us_states_γ[~merged_us_states_γ["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg).plot(
+    column='value', ax=ax, cmap='viridis', scheme="quantiles", legend=True, 
+    legend_kwds={"loc": "upper center", "ncol": 3}
+)
+_ = ax.axis('off');
+
+
+print(lc_hier_b_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]].to_latex(
+  index=True, column_format="rrrrrr",
   )
 )
 
-ax = az.plot_forest(az_data, var_names=["b"], combined=True, figsize=(10, 5))
-_ = ax[0].set_yticklabels(reversed(X.columns.to_list()))
+ax = az.plot_forest(hier_data, var_names=["b"], combined=True, figsize=(10, 5))
+grade_vars = [x for x in lc_hier_b_out.index if "grade" in x and not "fico" in x]
+_ = ax[0].set_yticklabels(reversed(lc_hier_b_out.index.to_list()))
 
-originator = "PR"
-X = X_dict[originator]
-X_risk = X_risk_dict[originator]
-risk_df = risk_dict[originator]
-data_df = data_dict[originator]
 
-az_data, hier_model, hier_trace, ppc = make_az_data(
-  originator, pymc3_dict, X, X_risk, risk_df
-)
-
-_, ax = plt.subplots(figsize=(10, 5))
-y_hat = np.array([x.mean() for x in ppc['yobs']])
-
-ax.hist(y_hat, bins=19, alpha=0.5)
-ax.axvline(data_df["defer"].mean())
-ax.set(xlabel='Deferment Pct.', ylabel='Frequency')
-ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
-
-pctile = np.percentile([x.mean() for x in ppc['yobs']], q=[5, 95])
-_ = ax.text(0.016, 1100, f'95% HPD: [{pctile[0]:.2%}, {pctile[1]:.2%}]')
-
-β_out = az.summary(az_data, var_names=['β'])
-β_out.index = X_risk.columns.to_list()
-print(β_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]].to_latex(
-  index=True, column_format="rrrrrr"
+pooled_trace, pooled_data, _, pooled_b_out = make_az_data(omap["PR"], "pooled")
+print(
+  pooled_b_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]].to_latex(
+     column_format="rrrrrr"
   )
 )
 
-state_agg_df = create_state_aggs(originator, hard_df, risk_df)
-defer_df = defer_prob(data_df, hier_trace)
-xbar_df = pd.merge(state_agg_df, defer_df, on="state")
-xbar_df.sort_values(by=["pct"], inplace=True)
+fig = make_ppc_plot(omap["PR"])
+fig.show()
 
-# plot 
-fig, ax = plt.subplots(1, 1, figsize=(18, 12))
-x = np.arange(xbar_df.index.max()+1)
-
-ax.plot(x, xbar_df.F_mean, color="green", label="Bayes-shrinkage survivor", linestyle="--")
-ax.scatter(x, xbar_df.pct, color="red", label="Naive MLE", alpha=0.5)
-ax.fill_between(
-    x, xbar_df.F_lo, xbar_df.F_hi, alpha=0.25, color='C1'
+hier_trace, hier_data, pr_hier_st_out, pr_hier_b_out = make_az_data(
+  omap["PR"], "hier"
+)
+dff_η = pr_hier_st_out.loc[idx[:, "η"], "mean"].droplevel(level=1).reset_index().rename(
+    columns={"mean": "value"}
 )
 
-ax.set_xlabel("State")
-ax.set_ylabel(f'Deferment Pct.: Week {data_df["stop"].astype(int).max()-1}')
-ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
-plt.xticks(x)
-ax.set_xticklabels(xbar_df.state, rotation=45, size=12)
-plt.legend(loc="upper left")
-sns.despine(left=True)
+us_states = gpd.read_file(
+  "https://www2.census.gov/geo/tiger/GENZ2018/shp/cb_2018_us_state_20m.zip"
+)
+merged_us_states_η = pd.merge(
+  us_states, dff_η, left_on="STUSPS", right_on="state", how="right")
 
-b_out = az.summary(az_data, var_names=['b'], round_to=3)
-b_out["odds"] = np.exp(b_out["mean"])
-b_out.index = X.columns.to_list()
-print(b_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat", "odds"]].to_latex(
-  index=True, column_format="rrrrrrr", formatters={
-    "odds": utils.number
-    }
+fig, ax = plt.subplots(1, figsize=(15, 18))
+albers_epsg = 2163
+ax = us_states[~us_states["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg).plot(
+    ax=ax, linewidth=0.25, edgecolor='white', color='grey'
+)
+
+ax = merged_us_states_η[~merged_us_states_η["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg).plot(
+    column='value', ax=ax, cmap='viridis', scheme="quantiles",  legend=True, 
+    legend_kwds={"loc": "upper center", "ncol": 3}
+)
+_ = ax.axis('off');
+
+
+dff_γ = pr_hier_st_out.loc[idx[:, "γ"], :].droplevel(level=1).reset_index().rename(
+    columns={"mean": "value"}
+)
+
+merged_us_states_γ = pd.merge(
+  us_states, dff_γ, left_on="STUSPS", right_on="state", how="right"
+)
+
+fig, ax = plt.subplots(1, figsize=(15, 18))
+albers_epsg = 2163
+ax = us_states[~us_states["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg).plot(
+    ax=ax, linewidth=0.25, edgecolor='white', color='grey'
+)
+
+ax = merged_us_states_γ[~merged_us_states_γ["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg).plot(
+    column='value', ax=ax, cmap='viridis', scheme="quantiles", legend=True, 
+    legend_kwds={"loc": "upper center", "ncol": 3}
+)
+_ = ax.axis('off');
+
+print(pr_hier_b_out[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]].to_latex(
+  index=True, column_format="rrrrrr",
   )
 )
 
-ax = az.plot_forest(az_data, var_names=["b"], combined=True, figsize=(10, 5))
-_ = ax[0].set_yticklabels(reversed(X.columns.to_list()))
+ax = az.plot_forest(hier_data, var_names=["b"], combined=True, figsize=(10, 5))
+grade_vars = [x for x in pr_hier_b_out.index if "grade" in x and not "fico" in x]
+_ = ax[0].set_yticklabels(reversed(pr_hier_b_out.index.to_list()))
 
-fname = files_dir + "claims.pkl"
-with open(fname, "rb") as f:
-  claims_dict = joblib.load(f)
+
+START_DATE = datetime.date(1995, 1, 1)
+CRISIS_START_DATE = datetime.date(2020, 3, 14)
+HOME_DIR = str(pathlib.Path.home())
+
+with open(HOME_DIR + "/.config/gcm/gcm.toml", "rb") as f:
+    config = pytoml.load(f)
+    FRED_API_KEY = config["api_keys"]["fred"]
 
 claims_az_data = claims_dict["az_data"]
 claims_sum_df = claims_dict["sum_df"]
@@ -487,33 +619,40 @@ A = 0
 κ = claims_trace["κ"]
 β = claims_trace["β"]
 
-def project_claims(state, covid_wt, sum_df, epi_enc, max_x=13, verbose=False):
+def project_claims(state, covid_wt, sum_df, epi_enc, verbose=False):
     ''' get labor market data from STL '''
     
     def states_data(suffix, state, fred):
         ''' gets data from FRED for a list of indices '''
 
+ 
         idx = "ICSA" if state == "US" else state + suffix            
         x =  pd.Series(
                 fred.get_series(
-                    idx, observation_start=common.START_DATE), name=v
+                    idx, observation_start=START_DATE), name=v
             )
 
         x.name = state
 
-        return x
+        return x    
     
-    def forecast_claims(initval, initdate, max_x, covit_wt):
+    def forecast_claims(initval, initdate, enddate, covid_wt):
         ''' project initial claims '''
     
         μ_β = sum_df.loc["β", "mean"]
         μ_κ = sum_df.loc[["κ: COVID", "κ: Katrina"], "mean"].values
         μ_decay = covid_wt * μ_κ[0] + (1 - covid_wt) * μ_κ[1]
         
+        dt_range = (
+            pd.date_range(start=initdate, end=enddate, freq="W") - 
+            pd.tseries.offsets.Day(1)
+        )
+        max_x = len(dt_range)
+        
         w = np.arange(max_x)
         covid_idx = list(epi_enc.classes_).index("COVID")
         katrina_idx = list(epi_enc.classes_).index("Katrina")
-
+        
         decay = covid_wt * κ[:, covid_idx] + (1 - covid_wt) * κ[:, katrina_idx]
         μ = np.exp(-decay * np.power(w.reshape(-1, 1), β))
         
@@ -522,7 +661,7 @@ def project_claims(state, covid_wt, sum_df, epi_enc, max_x=13, verbose=False):
             columns=["5th", "25th", "50th", "75th", "95th"]
         ) * initval
         μ_df["period"] = w
-        
+           
         ic = np.zeros(max_x)
         ic[0] = 1
         for j in np.arange(1, max_x, 1):
@@ -536,29 +675,36 @@ def project_claims(state, covid_wt, sum_df, epi_enc, max_x=13, verbose=False):
                 pd.Series((ic * initval).cumsum(), name="cum_ic")
             ], axis=1
         )
-        dt_range = pd.date_range(initdate, periods=max_x, freq="W") - pd.Timedelta(days=1)
+       
         df.index = dt_range
         μ_df.index = dt_range
     
         return df, μ_df
     
-        
-    fred = common.Fred(api_key=common.FRED_API_KEY)
+    fred = Fred(api_key=FRED_API_KEY)
     ic_raw = states_data("ICLAIMS", state, fred)
 
-    init_value, init_date = ic_raw[ic_raw.idxmax()], ic_raw.idxmax()
-    if verbose:
-      print(f'State: {state}, {init_value}, {init_date}')
+    init_value, init_date, last_date = (
+        ic_raw[ic_raw.idxmax()], ic_raw.idxmax(), ic_raw.index[-1]
+    )
+    end_date  = (
+        last_date + pd.tseries.offsets.QuarterEnd() + pd.tseries.offsets.DateOffset(months=3)
+    )
     
-    ic_fct, ic_pct = forecast_claims(init_value, init_date, max_x, covid_wt)
+    if verbose:
+        print(
+            f'State: {state}, {init_value}, {init_date}, {end_date}, {last_date}'
+        )
+    
+    ic_fct, ic_pct = forecast_claims(init_value, init_date, end_date, covid_wt)
     ic_fct["state"] = state
     ic_pct["state"] = state
     
-    return ic_raw, ic_fct, ic_pct, init_date
+    return ic_raw, ic_fct, ic_pct, init_date, end_date
 
 print(
   claims_sum_df[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]].to_latex(
-    bold_rows=True, column_format="rrrrrr"
+     column_format="rrrrrr"
   )
 )
 
@@ -597,7 +743,7 @@ fig.tight_layout()
 
 covid_wt = 0.9
 
-ic_raw, fct_df, ic_pct, init_date = project_claims(
+ic_raw, fct_df, ic_pct, init_date, end_date = project_claims(
   "US", covid_wt, claims_sum_df, claims_epi_enc
 )
 
@@ -635,3 +781,53 @@ ax[1].yaxis.set_major_formatter(mtick.StrMethodFormatter("{x:,.0f}"))
 ax[1].set(xlabel='Weeks from peak', ylabel='Initial claims')
 
 plt.tight_layout()
+
+
+def predict_hazard(originator):
+    ''' generates hazard predictions '''
+
+    horizon_date = datetime.date(2020, 9, 30)
+    sub_df = make_df(hard_df_dict[originator], ASOF_DATE, horizon_date)
+    
+    orig_model_key = ":".join([originator, "hier"])
+    aaa, zzz, s_1_df = simulate(
+      sub_df, claims_dict["chg_df"], originator, ASOF_DATE, out_dict[orig_model_key]
+    )
+
+    return zzz
+
+idx = pd.IndexSlice
+
+lc_zzz = predict_hazard(omap["LC"])
+pr_zzz = predict_hazard(omap["PR"])
+
+fig, ax = plt.subplots(1,2, figsize=(10, 5))
+for i in lc_zzz.index.get_level_values(0).to_series().sample(n=100, random_state=12345):
+    lc_zzz.loc[idx[i, "2020-03-14":"2020-07-26"], ["ymean"]].reset_index().plot(
+        x="edate", y="ymean", ax=ax[0], legend=False, alpha=0.25,
+        title="Originator " + omap["LC"]
+    )
+_ = ax[0].set(xlabel='Week ending', ylabel='Hazard')
+
+for i in pr_zzz.index.get_level_values(0).to_series().sample(n=100, random_state=12345):
+    pr_zzz.loc[idx[i, "2020-03-14":"2020-07-26"], ["ymean"]].reset_index().plot(
+        x="edate", y="ymean", ax=ax[1], legend=False, alpha=0.25,
+        title="Originator " + omap["PR"]
+    )
+_ = ax[1].set(xlabel='Week ending', ylabel='Hazard')
+plt.tight_layout()
+
+zzz = pm.model_to_graphviz(out_dict[omap["PR"] + ":hier"]["model"])
+_ = zzz.render(
+  directory="figures",
+  filename="pr_hier_model", format="png",
+  cleanup=True
+)
+
+df_η = lc_hier_st_out.loc[idx[:, "η"], :].droplevel(level=1)
+cnames = ["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]
+c_fmt = "".join(["r"] * (1 + df_η.shape[1]))
+print(df_η.to_latex(index=True))
+
+df_η = pr_hier_st_out.loc[idx[:, "η"], :].droplevel(level=1)
+print(df_η.to_latex(index=True))
