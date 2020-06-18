@@ -1,0 +1,409 @@
+\documentclass{report}
+
+\usepackage{arxiv}
+%\linespread{1.25}
+\renewcommand{\arraystretch}{1.25}
+
+%\renewcommand{\smallcaps}[1]{\sffamily #1}
+\usepackage{multirow}
+\usepackage{amssymb,mathtools}
+\usepackage{booktabs}
+\usepackage{verbatim}
+
+%
+\usepackage{hyperref}
+\hypersetup
+{ pdfauthor = {Gyan Sinha},
+  pdftitle={Modeling Initial Claims as Quasi-Natural Disasters},
+  colorlinks=TRUE,
+  linkcolor=black,
+  citecolor=blue,
+  urlcolor=blue
+}
+%
+\RequirePackage{fontspec}
+\setmainfont{Source Sans Pro}
+
+\usepackage{graphicx}
+\graphicspath{/home/gsinha/admin/docs/logos}
+
+\title{Modeling Initial Claims as Quasi-Natural Disasters}
+\author{Gyan Sinha, Godolphin Capital Management, LLC%
+\thanks{\scriptsize \emph{%Godolphin Capital Management, LLC,%
+\href{mailto:gsinha@godolphincapital.com}{Email Gyan}. This report
+has been prepared by Godolphin Capital Management, LLC
+(``Godolphin'') and is provided for informational purposes only and
+does not constitute an offer to sell or a solicitation to purchase
+any security. The contents of this research report are not intended
+to provide investment advice and under no circumstances does this
+research report represent a recommendation to buy or sell a security.
+The information contained herein reflects the opinions of Godolphin.
+Such opinions are based on information received by Godolphin from
+independent sources. While Godolphin believes that the information
+provided to it by its sources is accurate, Godolphin has not independently
+verified such information and does not vouch for its accuracy. Neither
+the author, nor Godolphin has undertaken any responsibility to update
+any portion of this research report in response to events which may
+transpire subsequent to its original publication date. As such, there
+can be no guarantee that the information contained herein continues
+to be accurate or timely or that Godolphin continues to hold the views
+contained herein. Godolphin is an investment adviser. Investments
+made by Godolphin are made in the context of various factors including
+investment parameters and restrictions. As such, there may not be
+a direct correlation between the views expressed in this article and
+Godolphin's trading on behalf of its clients. 
+<%print(f'Version:{datetime.datetime.now()}') %>}}
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+Unprecedented is a word often used in the context of the economic data
+being generated in the post-COVID world, but are there historical episodes
+that may be useful in serving as guide in terms of thinking about 
+near-term job losses after the initial shock observed in late March. What
+ could the path of initial claims be over the next few months, and what 
+ should we expect in terms of the total number of claims during thi period?
+
+In Bram \& Deitz~\cite{bramdeitz}, an interesting idea to answer this 
+question is explored --- that the COVID shock to labor markets is more akin 
+to a natural disaster like hurricane Katrina or Maria, rather than a classic 
+recession-induced hit to employment. As they correctly point out
+
+\begin{quote}
+Recessions typically develop gradually over time, reflecting underlying economic
+and financial conditions, whereas the current economic situation developed
+suddenly as a consequence of a fast-moving global pandemic. A more appropriate
+comparison would be to a regional economy suffering the effects of a severe natural
+disaster, like Louisiana after Hurricane Katrina or Puerto Rico after Hurricane Maria. 
+To illustrate this point, we track the recent path of unemployment claims in the 
+United States, finding a much closer match with Louisiana after Katrina than the 
+U.S. economy following the Great Recession.
+\end{quote}
+
+While the national scope of the COVID shock is clearly different and unprecedented, 
+there are similarities with natural disasters which by their nature, tend to be more
+localized. As such, they can provide insights into the way labor markets evolve in 
+the short-run. We do this by estimating exponential decay models for different episodes, 
+both natural-disaster related or recession-driven, and calibrate the parameters of 
+this process to the historical data on claims.
+
+
+\section{Model}
+To be precise, we posit that initial claims, normalized to their peak
+value during each episode, follow:
+
+\begin{equation}
+\label{eqn:ic_process}
+y_{t} = A \exp(-\kappa x^{\beta})\epsilon_{t}
+\end{equation}
+where $x$ is the number of weeks from the peak of initial claims
+during the episode and $\epsilon_{t} \sim \mathcal{LN}(0,\, \sigma_{y})$%
+\footnote{Estimating the model in logarithms linearizes it and
+makes the right-hand side additive.}. 
+The parameter $A$ is normalized to 1, so we just have the
+2 parameters $\kappa$ and $\beta$ to estimate. We go further and 
+specify episode-specific parameters that drive this process, so
+these become $\kappa_{j}$ and $\beta_{j}$ where $j$ is an 
+episode-specific index. The smaller the $\kappa$ parameter,
+the longer it takes for the iniital shock to claims to taper down.
+
+<<claims_setup, echo=False>>=
+import datetime
+import joblib
+import pathlib
+
+import pandas as pd
+import numpy as np
+import pytoml
+
+from fredapi import Fred
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import seaborn as sns
+sns.set()
+
+plt.rcParams.update({
+    "font.family": "Source Sans Pro",
+    "font.serif": ["Source Sans Pro"], 
+    "font.sans-serif": ["Source Sans Pro"],
+    "font.size": 10,
+})
+
+models_dir = "/home/gsinha/admin/db/dev/Python/projects/models/"
+data_dir = models_dir + "data/"
+
+fname = data_dir + "claims.pkl"
+with open(fname, "rb") as f:
+    claims_dict = joblib.load(f)
+
+START_DATE = datetime.date(1995, 1, 1)
+CRISIS_START_DATE = datetime.date(2020, 3, 14)
+HOME_DIR = str(pathlib.Path.home())
+
+with open(HOME_DIR + "/.config/gcm/gcm.toml", "rb") as f:
+    config = pytoml.load(f)
+    FRED_API_KEY = config["api_keys"]["fred"]
+
+claims_az_data = claims_dict["az_data"]
+claims_sum_df = claims_dict["sum_df"]
+claims_trace = claims_dict["trace"]
+claims_data = claims_dict["data"]
+claims_epi_enc = claims_dict["epi_enc"]
+claims_sim_dict = claims_dict["sim_dict"]
+
+A = 0
+κ = claims_trace["κ"]
+β = claims_trace["β"]
+
+def project_claims(state, covid_wt, sum_df, epi_enc, verbose=False):
+    ''' get labor market data from STL '''
+    
+    def states_data(suffix, state, fred):
+        ''' gets data from FRED for a list of indices '''
+
+ 
+        idx = "ICSA" if state == "US" else state + suffix            
+        x =  pd.Series(
+                fred.get_series(
+                    idx, observation_start=START_DATE), name=v
+            )
+
+        x.name = state
+
+        return x    
+    
+    def forecast_claims(initval, initdate, enddate, covid_wt):
+        ''' project initial claims '''
+    
+        μ_β = sum_df.loc["β", "mean"]
+        μ_κ = sum_df.loc[["κ: COVID", "κ: Katrina"], "mean"].values
+        μ_decay = covid_wt * μ_κ[0] + (1 - covid_wt) * μ_κ[1]
+        
+        dt_range = (
+            pd.date_range(start=initdate, end=enddate, freq="W") - 
+            pd.tseries.offsets.Day(1)
+        )
+        max_x = len(dt_range)
+        
+        w = np.arange(max_x)
+        covid_idx = list(epi_enc.classes_).index("COVID")
+        katrina_idx = list(epi_enc.classes_).index("Katrina")
+        
+        decay = covid_wt * κ[:, covid_idx] + (1 - covid_wt) * κ[:, katrina_idx]
+        μ = np.exp(-decay * np.power(w.reshape(-1, 1), β))
+        
+        μ_df = pd.DataFrame(
+            np.percentile(μ, q=[5, 25, 50, 75, 95], axis=1).T, 
+            columns=["5th", "25th", "50th", "75th", "95th"]
+        ) * initval
+        μ_df["period"] = w
+           
+        ic = np.zeros(max_x)
+        ic[0] = 1
+        for j in np.arange(1, max_x, 1):
+            ic[j] = np.exp(-μ_decay * np.power(j, μ_β))
+        
+        df = pd.concat(
+            [
+                pd.Series(np.arange(max_x), name="period"),
+                pd.Series(ic, name="ic_ratio"),
+                pd.Series(ic * initval, name="ic"),
+                pd.Series((ic * initval).cumsum(), name="cum_ic")
+            ], axis=1
+        )
+       
+        df.index = dt_range
+        μ_df.index = dt_range
+    
+        return df, μ_df
+    
+    fred = Fred(api_key=FRED_API_KEY)
+    ic_raw = states_data("ICLAIMS", state, fred)
+
+    init_value, init_date, last_date = (
+        ic_raw[ic_raw.idxmax()], ic_raw.idxmax(), ic_raw.index[-1]
+    )
+    end_date  = (
+        last_date + pd.tseries.offsets.QuarterEnd() + pd.tseries.offsets.DateOffset(months=3)
+    )
+    
+    if verbose:
+        print(
+            f'State: {state}, {init_value}, {init_date}, {end_date}, {last_date}'
+        )
+    
+    ic_fct, ic_pct = forecast_claims(init_value, init_date, end_date, covid_wt)
+    ic_fct["state"] = state
+    ic_pct["state"] = state
+    
+    return ic_raw, ic_fct, ic_pct, init_date, end_date
+@
+
+\section{Results}
+In Table~\ref{tbl:claims_decay_tbl}, we present the results of the
+exponential decay model. 
+The $\kappa$ parameter ranges from a low
+of <%print(f'{claims_sum_df.loc["κ: GFC", "mean"]:.2f}') %> during
+the Great Recession (GFC) to 
+a high of <%print(f'{claims_sum_df.loc["κ: Katrina", "mean"]:.2f}') %>
+in the aftermath of Katrina. The estimate for the current COVID
+episode is <%print(f'{claims_sum_df.loc["κ: COVID", "mean"]:.2f}') %>,
+in between the 2 but subject to considerable uncertainty given we
+are still early in the process. As more data becomes available, 
+the 95\% credibility intervals will shrink but we have to be
+cognizant of the fact that any projections will of necessity be
+subject to fairly wide error bands. Regardless, the initial
+results out of the gate suggest a pattern of behavior more in
+line with natural disasters rather than the longer tapering
+timeframes evidenced during and after recessions%
+\footnote{Based on a judgment call given some of the early
+fit results, we used a weighted $\kappa$ value 
+for the claims projections, using a 90\% weight on the COVID value
+and a 10\% weight on the Katrina value.}.
+
+\begin{table}[htb]
+\centering
+\caption{Initial claims: exponential-decay}
+\label{tbl:claims_decay_tbl}
+\scalebox{1}{
+<<claims_decay_tbl, echo=False, results="tex">>=
+print(
+  claims_sum_df[["mean", "sd", "hpd_3%", "hpd_97%", "r_hat"]].to_latex(
+     column_format="rrrrrr"
+  )
+)
+@
+}
+
+\end{table}
+In Figure~\ref{fig:claims_model_fits}, we present the model predictions and
+the associated 1 and 2 standard deviation ranges versus the observed data
+on claims (relative to the peak) for each episode. Overall, the fits match
+the historical experience quite well, except for the aftermath of Hurricane
+Sandy where the initial data points come down much more sharply than the
+model predictions. Note the relatively wide confidence bands for both 
+the current ``COVID'' episode and the history of claims after 9/11.
+
+\begin{figure}[htb]
+\centering
+\caption{Model fits \emph{vs} actuals}
+\label{fig:claims_model_fits}
+\scalebox{1}{
+<<claims_model_fits, echo=False>>=
+fig, ax = plt.subplots(2, 3, figsize=(12, 6))
+
+for i, v in enumerate(["κ: " + x for x in claims_epi_enc.classes_]):
+    
+    xx = claims_data[claims_data.epi_idx==i]["x"].values
+    yy = claims_data[claims_data.epi_idx==i]["y"].values
+    xx = xx.reshape((xx.max() + 1, 1))
+    
+    mu = A - κ[:, i].reshape(-1,1) * np.power(xx, β).T
+    ic_hat_means = mu.mean(axis=0)
+    ic_hat_se = mu.std(axis=0)
+    
+    j = i % 3
+    l = 0 if i < 3 else 1
+    ax[l, j].plot(xx, yy, 'C0.')
+    ax[l, j].plot(xx, np.exp(ic_hat_means), c='k')
+
+    ax[l, j].fill_between(
+        xx[:, 0], np.exp(ic_hat_means + 1 * ic_hat_se),
+        np.exp(ic_hat_means - 1 * ic_hat_se), alpha=0.6,
+        color='C1'
+    )
+    ax[l, j].fill_between(
+        xx[:, 0], np.exp(ic_hat_means + 2 * ic_hat_se),
+        np.exp(ic_hat_means - 2 * ic_hat_se), alpha=0.4,
+        color='C1'
+    )
+    ax[l, j].set_xlabel('Weeks since peak')
+    ax[l, j].set_ylabel('Pct. of peak')
+    ax[l, j].set_title(f'Episode: {v} = {claims_sum_df.loc[v, "mean"]}')
+    
+fig.tight_layout()
+@
+}
+
+\end{figure}
+
+\section{Forecasts}
+In Figure~\ref{fig:cum_ic_claim}, we present the forecast for the US
+over a 13-week horizon. Both weekly and cumulative claim totals
+since the start of the episodic peak are presented. 
+
+\begin{figure}[htb]
+\centering
+\caption{Initial claim projections: US}
+\label{fig:cum_ic_claim}
+\scalebox{1}{
+<<cum_ic_claim, echo=False>>=
+covid_wt = 0.9
+
+ic_raw, fct_df, ic_pct, init_date, end_date = project_claims(
+  "US", covid_wt, claims_sum_df, claims_epi_enc
+)
+
+fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+
+ax[0].plot(ic_pct["period"], ic_pct["50th"].cumsum())
+ax[0].scatter(
+  claims_data[claims_data.epi_idx==1]["x"], 
+  (claims_data[claims_data.epi_idx==1]["y"] * ic_pct.iloc[0, 1]).cumsum()
+)
+ax[0].fill_between(
+    ic_pct["period"], (ic_pct["25th"]).cumsum(), (ic_pct["75th"]).cumsum(), 
+    alpha=0.6, color='C1'
+)
+ax[0].fill_between(
+    ic_pct["period"], ic_pct["5th"].cumsum(), ic_pct["95th"].cumsum(), alpha=0.4,
+    color='C1'
+)
+ax[0].yaxis.set_major_formatter(mtick.StrMethodFormatter("{x:,.0f}"))
+ax[0].set(xlabel='Weeks from peak', ylabel='Cum. initial claims')
+
+ax[1].plot(ic_pct["period"], ic_pct["50th"])
+ax[1].scatter(
+  claims_data[claims_data.epi_idx==1]["x"], 
+  (claims_data[claims_data.epi_idx==1]["y"] * ic_pct.iloc[0, 1])
+)
+ax[1].fill_between(
+    ic_pct["period"], (ic_pct["25th"]), (ic_pct["75th"]), alpha=0.6, color='C1'
+)
+ax[1].fill_between(
+    ic_pct["period"], ic_pct["5th"], ic_pct["95th"], alpha=0.4,
+    color='C1'
+)
+ax[1].yaxis.set_major_formatter(mtick.StrMethodFormatter("{x:,.0f}"))
+ax[1].set(xlabel='Weeks from peak', ylabel='Initial claims')
+
+plt.tight_layout()
+@
+}
+\end{figure}
+
+\textbf{Since the peak on <%print(f'{init_date.strftime("%B %-d, %Y")}') %>, 
+the model generates a median cumulative claims estimate of 
+<%print(f'{1.e-6*ic_pct["50th"].cumsum()[-1]:,.2f}')%>
+million, with a 95\% confidence band of %
+<%print(f'{1.e-6*ic_pct["5th"].cumsum()[-1]:.2f}') %> million and %
+<%print(f'{1.e-6*ic_pct["95th"].cumsum()[-1]:.2f}') %> million claims. }
+The middle half of the projections span the range from
+<%print(f'{1.e-6*ic_pct["25th"].cumsum()[-1]:.2f}') %> million to %
+<%print(f'{1.e-6*ic_pct["75th"].cumsum()[-1]:.2f}') %> million claims. 
+While the 95\% confidence bands for cumulative claims are relatively wide
+(over the entire 13 week period), they simply reflect the uncertainty inherent in
+the fact that we are still early in the process. Given the current total of roughly
+26 million claims already incurred, the median estimate calls for roughly double
+the current amount over the weeks remaining in the second quarter.
+
+\bibliographystyle{plainnat}
+\bibliography{corona}
+
+\end{document}
