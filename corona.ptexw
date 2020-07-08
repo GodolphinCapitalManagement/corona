@@ -882,7 +882,7 @@ plt.tight_layout()
 pooled_result = make_az_data("pooled", out_dict)
 pooled_df = out_dict["pooled"]["test"]
 pooled_ppc, pooled_out_df =  predict(
-    None, pooled_df, dep_var, claims_dict["chg_df"], out_dict["pooled"], 
+    None, pooled_df, dep_var, out_dict["pooled"], ic_long_df=None,
     n_samples=4000, verbose=False
 )
 @
@@ -1017,13 +1017,15 @@ E = pooled_result.E
 b_names = pooled_result.b_names
 n_intervals = pooled_result.n_intervals
 
-α = pooled_b_out.iloc[:n_intervals]["mean"]
-β = pooled_b_out.iloc[n_intervals:]["mean"]
+α = pooled_result.a_out["mean"]
+β = pooled_result.b_out["mean"]
 c = None
+d = None
+
 dp_dx = pd.DataFrame(
     {"param": b_names, 
      "dp_dx": 10000 * np.array(
-       [d_poisson(X, A, U, E, α, β, c, v, "pooled") for i, v in enumerate(b_names)]
+       [d_poisson(X, A, U, E, α, β, c, d, v, "pooled", False) for i, v in enumerate(b_names)]
        )
     }
 )
@@ -1051,7 +1053,7 @@ requests. Further technical details are provided in the appendix.
 hier_result = make_az_data("hier", out_dict)
 hier_df = out_dict["hier"]["test"]
 hier_ppc, hier_out_df =  predict(
-    None, hier_df, dep_var, claims_dict["chg_df"], out_dict["hier"], 
+    None, hier_df, dep_var, out_dict["hier"], ic_long_df=None,
     n_samples=1000, verbose=False
 )
 @
@@ -1174,16 +1176,18 @@ b_names = hier_result.b_names
 a = hier_result.a_out["mean"]
 b = hier_result.b_out["mean"]
 c = hier_result.trace["c_μ"].mean()
+d = hier_result.trace["γ_μ"].mean()
 
 p_s_2 = out_dict["hier"]["pipe"]["p_s_2"]
 non_poly_vars =  list(
   set(b.index) - set(np.array(p_s_2.named_steps.poly.colnames).ravel().tolist())
 )
+frailty = True
 
 dp_dx = pd.DataFrame(
     {"param": non_poly_vars, 
     "dp_dx": 10000 * np.array(
-      [d_poisson(X, A, U, E, a, b, c, v, "hier") for i, v in enumerate(non_poly_vars)]
+      [d_poisson(X, A, U, E, a, b, c, d, v, "hier", frailty) for i, v in enumerate(non_poly_vars)]
       )
     }
 )
@@ -1240,14 +1244,16 @@ A = hier_result.A
 U = hier_result.U 
 E = hier_result.E
 
+a = hier_result.a_out["mean"]
+b = hier_result.b_out["mean"]
+d = hier_result.trace["γ_μ"].mean()
+
 cbeta_d = []
 for i, v in enumerate(hier_result.state_index_map.state):
-    a = hier_result.a_out["mean"]
-    b = hier_result.b_out["mean"]
-    
+
     indx = hier_result.state_index_map.set_index("state").loc[v, "level_0"]
     c = hier_result.trace["c"][:, indx].mean()
-    dp_dx =  10000 * np.array(d_poisson(X, A, U, E, a, b, c, "std_pct_ic", "hier"))
+    dp_dx =  10000 * np.array(d_poisson(X, A, U, E, a, b, c, d, "std_pct_ic", "hier", frailty))
     cbeta_d.append([v, dp_dx])
 
 cbeta_df = pd.DataFrame(cbeta_d, columns=["state", "ame"])
@@ -1315,13 +1321,13 @@ test_df = out_dict["hier"]["test"]
 sub_df = make_df(test_df, dep_var, horizon_date)
 
 aaa, zzz, _ = simulate(
-    None, sub_df, dep_var, claims_dict["chg_df"], "hier", out_dict
+    None, sub_df, dep_var, "hier", out_dict, claims_dict["chg_df"]
 )
 zzz.set_index(["loan_id", "edate"], inplace=True)
 zzz.sort_index(inplace=True)
 
 zzz["fhaz"] = zzz.groupby(level=0).agg(chaz=("ymean", np.cumsum))["chaz"].map(lambda x: 1 - np.exp(-x))
-zzz_df = zzz.groupby("stop").agg(
+zzz_df = zzz.groupby("start").agg(
     y=(dep_var, np.mean), ymean=("ymean", np.mean),
     ystd=("ystd", np.mean), y5=("y5", np.mean), y95=("y95", np.mean)
 ).reset_index()
@@ -1357,9 +1363,9 @@ _ =ax[0].set_xlabel("Deferment Pct.")
 
 # hazards
 
-ax[1].plot(zzz_df["stop"], zzz_df["ymean"], label="Predicted")
+ax[1].plot(zzz_df["start"], zzz_df["ymean"], label="Predicted")
 ax[1].fill_between(
-    zzz_df["stop"], zzz_df["y5"], 
+    zzz_df["start"], zzz_df["y5"], 
     zzz_df["y95"], color="red", alpha=0.05, label="95% Interval"
 )
 
@@ -1719,6 +1725,7 @@ in a systematic way and allows us to write the hazard as:
 \end{equation}
 where $\lambda_{0,j}$ represents an unspecified baseline hazard.
 
+\begin{comment}
 When durations are observed only over grouped intervals (we know an
 event occurred between period $t_{k-1}$ and period $t_{k}$), then
 the probability of observing an exit in the interval $[t_{k-1}, t_{k}]$
@@ -1754,6 +1761,8 @@ P(y_{j,t_{k}} = 1) = 1 - \exp \left \{ -\exp(x_{t}'\beta + \alpha_{t_{k}} ) \rig
         models or equivalently as a set of pairwise binary dependent models in a
         situation where multiple events are possible.
 \end{itemize}
+
+\end{comment}
 
 The likelihood function for this model can be derived as follows. Suppose we
 have observations $t_{i}$ on $N$ lifetimes of interest (e.g., time to a deferral
