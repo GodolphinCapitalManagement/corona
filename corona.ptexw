@@ -189,20 +189,16 @@ def make_ppc_plot(ppc, out_df):
 @
 
 <<datasets, echo=False>>=
-# just need one issuer for the combined data
 hard_df = out_dict["hier"]["hard_df"]
-
 ic_date = (
   out_dict["hier"]["pipe"]["p_s_1"].named_steps.add_state_macro_vars.ic_long_df["edate"].max().date()
 )
 data_scaler = (
     out_dict["hier"]["pipe"]["p_s_2"].named_steps["standardize"].numeric_transformer.named_steps["scaler"]
 )
-
 numeric_features = [
     "fico", "original_balance", "dti", "stated_monthly_income", "age", "pct_ic"
 ]
-
 data_scaler_dict = {
     "mu" : dict(zip(numeric_features, data_scaler.mean_)),
     "sd":  dict(zip(numeric_features, data_scaler.scale_))
@@ -596,9 +592,9 @@ Table~\ref{tbl:pre_covid_dq_profile}.
 
 \begin{table}[ht]
 \centering
-\caption{DQ \emph{vs} COVID profile}
+\caption{DQ \emph{vs} Deferment profile}
 \label{tbl:pre_covid_dq_profile}
-\scalebox{0.75}{
+\scalebox{0.70}{
 <<pre_covid_dq_profile, echo=False, results="tex">>=
 dq_tbl = summary_by_group(
     ["originator", "loanstatus"], dep_var, hard_df
@@ -606,7 +602,7 @@ dq_tbl = summary_by_group(
 dq_tbl.index.names = ["Originator", "DQ Status"]
 cfmt = "".join(["r"] * (dq_tbl.shape[1] + 2))
 print(
-    dq_tbl.to_latex(
+    dq_tbl.iloc[:-1].to_latex(
       index=True, multirow=True, 
       header=header,
       
@@ -1300,6 +1296,27 @@ _ = ax.axis('off')
 
 \end{figure}
 
+\subsection{Originator effect}
+In this section, we provide estimates of the effect that 
+the identity of the originator on the hazards. These
+are provided in Table~\ref{tbl:orig_impact}.
+
+\begin{table}
+\centering
+\caption{Originator effect}
+\label{tbl:orig_impact}
+<<orig_impact, echo=False, results="tex" >>=
+g_out = hier_result.g_out
+print(g_out[["mean", "sd", "hdi_3%", "hdi_97%", "r_hat"]].to_latex(
+  index=True, column_format="rrrrrr"))
+@
+\end{table}
+
+Confirming the results of the non-parametric Aalen fits presented
+earlier, the first originator has a higher estimated baseline
+hazard than the second, as evidenced by its larger $\gamma$
+parameter.
+
 \section{Forecasts}
 In this section, we take the test portfolio and project the deferment hazards forward until
 the end of the third quarter. We do this by using the estimated hazard 
@@ -1376,14 +1393,29 @@ _ = plt.tight_layout()
 }
 \end{figure}
 
-\section{Why Mixed-Models}
+\section{Model comparison}
 In this section, we examine a basic question --- given the additional
 complexity of mixed (or multi-level) models and the bayesian
 estimation framework, is any of it worth it? We demonstrate 
 the utility of the approach adopted here by asking an important
-question, one of many that can be asked. 
+question, one of many that can be asked.
 
-\subsection{Causal effects}
+We approach the model comparison exercise in two ways. First,
+we use Leave-One-Out (LOO) cross validation to derive an 
+estimate of out-of-sample fit for both models. Second, we 
+use a more traditional probability calibration framework
+to compare predicted and observed survival outcomes at
+a defined event-time.
+
+\subsection{Leave-One-Out (LOO) comparison}
+In the LOO comparison framework, the
+training dataset is repeatedly partitioned into training 
+and testing sets by leaving a single observation out,
+using an efficient algorithm developed by~\cite{vehtari_practical_2017}
+that uses posterior samples from the MCMC algorithm. 
+The computation uses Pareto-smoothed Importance Sampling (PSIS) to calculate
+point-wise out-of-sample prediction accuracy. These
+results are provided in Table~\ref{tbl:loo_pool_hier}.
 
 \begin{table}
 \centering
@@ -1404,10 +1436,6 @@ if do_loo:
 @
 \end{table}
 
-\textbf{This supports our view that there is potential for 
-meaningful improvement in forecasting ability using a mixed
-models approach relative to a more tradiional approach which
-pools the data across states and originators.}
 
 \subsection{Calibration}
 Another important real-world justification for any probabilistic model,
@@ -1463,6 +1491,10 @@ for k, v in calib_dict.items():
     ax[i].set_xlabel("Predicted probability of \nt ≤ %.1f deferment" % t0)
     ax[i].set_ylabel("Observed probability of \nt ≤ %.1f deferment" % t0, color=color)
     ax[i].tick_params(axis="y", labelcolor=color)
+
+    for j in v.itertuples():
+        ax[i].text(j.poutcome - 0.001, j.observed - 0.01, j[0])
+
     ax[i].legend(loc = "upper left")
     
     i += 1
@@ -1551,12 +1583,17 @@ print(
 @
 \end{table}
 We also report the the median and 95th percentiles of the absolute differences
-for each observation in the ``test'' dataset.
+for each observation in the ``test'' dataset. The hierarchical model is 
+unambibuously better than the pooled model
+in terms of the ICI, the median of the absolute differences
+and the predictions in the tail of the probability distribution of outcomes,
+offering substantial improvement over the pooled model.
 
-The hierarchical model is slightly worse than the pooled model
-in terms of the ICI and the median of the absolute differences
-but the predictions in the tail of the probability distribution of outcomes
-offer a substantial improvement over the pooled model.
+Taken together, the two model comparison frameworks support
+our view that there is potential for meaningful improvement in 
+forecasting ability using a mixed models approach relative to a 
+more traditional approach which pools the data across states and 
+originators.
 
 \section{Conclusion}
 
@@ -1896,14 +1933,14 @@ _ = zzz.render(
 \includegraphics[width=\linewidth]{figures/hier_model.png}
 \end{figure}
 
-In our model, the impact of duration, the year-over-year percentage change in 
-weekly initial claims, and all loan-level attributes are treated this way. 
+In our model, the impact of the year-over-year percentage change in 
+weekly initial claims is treated this way. 
 
 \begin{equation}
 \label{eqn:hierarchical}
 \begin{array}{lcl}
-  \beta_{ij} & \sim & \mathcal{N}(\mu_{\beta}^{j}, \sigma_{\beta}^{j})\\
-  \mu_{\beta}^{j} & \sim & \mathcal{N}(\mu_{\beta}, \sigma_{\beta})\\
+  c_{ij} & \sim & \mathcal{N}(\mu_{c}^{j}, \sigma_{c}^{j})\\
+  \mu_{c}^{j} & \sim & \mathcal{N}(\mu_{c}, \sigma_{c})\\
 \end{array}
 \end{equation}
 
@@ -1937,7 +1974,6 @@ simplifies the interpretation of the model coefficients. The intercept
 term for each state can then be used to compute the probability of
 deferment for a ``reference'' loan. 
 
-
 In our case, this loan can 
 be defined as a \textbf{Grade 1} loan, with the following additional characterstics:\,
 \textbf{FICO:} <%print(f'{data_scaler_dict["mu"]["fico"]:.2f}')%>, \,
@@ -1955,9 +1991,9 @@ the \textbf{amortization term} of the loan was 3 years, and that the borrower
 the $x$ term is a zero matrix, leaving the intercept as the only
 term on the right-hand side. 
 
-The variables in the $z$ matrix have a similar interpretation ---
-they represent the deviation from the mean of the weekly claims ratio.
-
+As a final iteration on the basic model, we have an originator-specific
+``frailty'' term that multiplies the hazard for each observation, scaling
+it up or down. This is the $\gamma$ term in the hierarchical model illustration.
 
 \bibliographystyle{plainnat}
 \bibliography{corona}
