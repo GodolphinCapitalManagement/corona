@@ -6,5 +6,6 @@
 *.tex
 *.png
 *.out
+build.sh
 
 corona.py
