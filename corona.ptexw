@@ -1004,32 +1004,7 @@ specified as $P(y | X\beta) = \exp(X\beta)$.
 \caption{Pooled Model: Average Marginal Effects}
 \label{fig:pooled_avg_marginal_effect}
 <<pooled_avg_marginal_effect, echo=False>>=
-
-X = pooled_result.X
-A = pooled_result.A
-U = None
-E = pooled_result.E
-
-b_names = pooled_result.b_names
-n_intervals = pooled_result.n_intervals
-
-α = pooled_result.a_out["mean"]
-β = pooled_result.b_out["mean"]
-c = None
-d = None
-
-dp_dx = pd.DataFrame(
-    {"param": b_names, 
-     "dp_dx": 10000 * np.array(
-       [d_poisson(X, A, U, E, α, β, c, d, v, "pooled", False) for i, v in enumerate(b_names)]
-       )
-    }
-)
-
-fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-sns.barplot(data=dp_dx, y="param", x="dp_dx", ax=ax)
-ax.set_ylabel("Parameter")
-_ = ax.set_xlabel("dP/dX (bps)")
+plot_ame(out_dict, "pooled", pooled_ppc)
 @
 \end{figure}
 
@@ -1128,18 +1103,7 @@ and originators.
 
 \subsubsection{Feature impact}
 
-The population means, from which the random effects for each state are 
-assumed to be drawn, are presented in Table~\ref{tbl:pop_means}.
-The intercept terms $t_{i}$  encapsulate the baseline hazard for the
-``average'' loan in the population. The $\eta$ term represents the
-average impact of a 1 standard-deviation move in the year-over-year
-percentage change in weekly initial claims. 
-
-In Table~\ref{tbl:pop_means}, we present the estimates
-for the population parameters. These should be interpreted
-as the mean values from which the cluster-specific coefficients
-for state and further down state/originator combinations, are
-drawn from.
+The fixed-effect estimates are presented in Table~\ref{tbl:pop_means}.
 
 \begin{table}[htb!]
 \centering
@@ -1156,85 +1120,28 @@ print(b_μ_out[["mean", "sd", "hdi_3%", "hdi_97%", "r_hat"]].to_latex(
 \end{table}
 
 
-\begin{figure}
+\begin{figure}[htb!]
 \caption{Hierarchical model: Average Marginal Effects (population)}
 \label{fig:hier_pop_avg_marginal_effect}
 <<hier_pop_avg_marginal_effect, echo=False>>=
-
-X = hier_result.X
-A = hier_result.A
-U = hier_result.U
-E = hier_result.E 
-
-a_names = hier_result.a_names
-b_names = hier_result.b_names
-
-a = hier_result.a_out["mean"]
-b = hier_result.b_out["mean"]
-c = hier_result.trace["c_μ"].mean()
-d = hier_result.trace["γ_μ"].mean()
-
-p_s_2 = out_dict["hier"]["pipe"]["p_s_2"]
-non_poly_vars =  list(
-  set(b.index) - set(np.array(p_s_2.named_steps.poly.colnames).ravel().tolist())
-)
-frailty = True
-
-dp_dx = pd.DataFrame(
-    {"param": non_poly_vars, 
-    "dp_dx": 10000 * np.array(
-      [d_poisson(X, A, U, E, a, b, c, d, v, "hier", frailty) for i, v in enumerate(non_poly_vars)]
-      )
-    }
-)
-
-fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-sns.barplot(data=dp_dx, y="param", x="dp_dx", ax=ax)
-ax.set_ylabel("Parameter")
-_ = ax.set_xlabel("dP/dX (bps)")
-
-dp_dx_df = dp_dx.set_index("param")
+plot_ame(out_dict, "hier", hier_ppc)
 @
 \end{figure}
 
-We discuss the results for the categorical covariate in turn, in order of
-prevalence in the data and the magnitude of the effect.
-\begin{description}
-  
-  \item [Employment status:] Borrowers categorized as ``Self-employed'' raise
-    the weekly hazard by about <%print(f'{dp_dx_df.loc["employment_status[T.Self-employed]", "dp_dx"]:.0f}') %> 
-    while borrowers in the catch-all ``Other'' category (between 7\% to 8\% of the pool) reduce 
-    the weekly hazard by about <%print(f'{dp_dx_df.loc["employment_status[T.Other]", "dp_dx"]:.0f}')%> bps
-    \footnote{We note that inn the case of Originator I, the 
-    ``Self-employed'' tag is an empty dummy indicator with a value of 0 for all observations.}.
+Average Marginal Effects for the hierarchical model are 
+presented in Figure~\ref{fig:hier_pop_avg_marginal_effect}.
+The variation in the the impact of claims across states 
+is presented in Figure~\ref{fig:claims_sensitivity}.
 
-  \item [Purpose:] Loans taken out for asset puchases and the catch-all ``other''
-    category increase the weekly hazard rate by <%print(f'{dp_dx_df.loc["purpose[T.Acquisition]", "dp_dx"]:.0f}')%> and
-    <%print(f'{dp_dx_df.loc["purpose[T.Other]", "dp_dx"]:.0f}')%> bps respectively.
-  
-  \item [Homeownership:] Renters raise the weekly risk by about 
-    <%print(f'{dp_dx_df.loc["home_ownership[T.Rent]", "dp_dx"]:.0f}')%> bps relative to
-    borrowers that own their home.
-
-  \item [Term:] 5-year loans are raise the weekly risk by about 
-    <%print(f'{dp_dx_df.loc["term[T.Y5]", "dp_dx"]:.0f}')%> bps relative to
-    3-year loans.
-
-\end{description}
-
-The variation in feature impacts across the population of states 
-is presented in Figures~\ref{fig:pop_variation_feature_impact}
-and~\ref{fig:claims_sensitivity}   --- the second figure in the 
-form of a choropleth map of the US states
-where the sensitivities are grouped into quantiles and color coded. 
-
+\begin{comment}
 \begin{figure}
 \centering
 \caption{Claims impact: variation across states}
 \label{fig:pop_variation_feature_impact}
 <<pop_variation_feature_impact, echo=False>>=
 b_names = hier_result.b_names
-    
+frailty = True
+
 X = hier_result.X
 A = hier_result.A
 U = hier_result.U 
@@ -1263,8 +1170,43 @@ ax.set_ylabel("State")
 _ = ax.set_yticklabels(ax.get_yticklabels(), size=10)
 @
 \end{figure}
+\end{comment}
 
 
+The uncertainty around the impact of claims on deferment rates is 
+visually presented in Figure~\ref{fig:claims_vol}.
+\begin{figure}
+\centering
+\caption{Uncertainty in claims impact}
+\label{fig:claims_vol}
+<<claims_vol, echo=False >>=
+cbeta_d = []
+for i, v in enumerate(hier_result.state_index_map.state):
+
+    indx = hier_result.state_index_map.set_index("state").loc[v, "level_0"]
+    trace = hier_result.trace["c"][:, indx]
+    x = pd.Series(ame_obs_var(trace, hier_ppc), name=v)
+    cbeta_d.append(
+        pd.DataFrame(
+            np.quantile(x, q=[0.025, 0.50, 0.975]).reshape(-1, 3),
+            columns=["lo", "med", "hi"]
+        )
+    )
+    
+cbeta_df = pd.DataFrame(10000 * pd.concat(cbeta_d)).reset_index()
+cbeta_df["state"] = hier_result.state_index_map.state
+cbeta_df.sort_values("med", ascending=False, inplace=True)
+
+fig, ax = plt.subplots(1, 1, figsize=(12, 12/1.61))
+
+ax.vlines(cbeta_df.state, cbeta_df.lo, cbeta_df.hi, "tab:red")
+ax.scatter(cbeta_df.state, cbeta_df.med, color="tab:blue")
+plt.setp(ax.get_xticklabels(), ha="right", size=9, rotation=30)
+ax.set_xlabel("State")
+_ = ax.set_ylabel("dP/dX (bps)")
+
+@
+\end{figure}
 
 \begin{figure}[htb!]
 \centering
@@ -1287,7 +1229,7 @@ ax = us_states[~us_states["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg
 )
 
 ax = merged_us_states_c[~merged_us_states_c["STATEFP"].isin(['02', '15'])].to_crs(epsg=albers_epsg).plot(
-    column='ame', ax=ax, cmap='viridis', 
+    column='med', ax=ax, cmap='viridis', 
     scheme="quantiles", legend=True,  legend_kwds={"loc": "upper center", "ncol": 3}
 )
 _ = ax.axis('off')
@@ -1393,7 +1335,7 @@ _ = plt.tight_layout()
 }
 \end{figure}
 
-\section{Model comparison}
+\section{Comparison}
 In this section, we examine a basic question --- given the additional
 complexity of mixed (or multi-level) models and the bayesian
 estimation framework, is any of it worth it? We demonstrate 
@@ -1407,7 +1349,7 @@ use a more traditional probability calibration framework
 to compare predicted and observed survival outcomes at
 a defined event-time.
 
-\subsection{Leave-One-Out (LOO) comparison}
+\subsection{Leave-One-Out (LOO)}
 In the LOO comparison framework, the
 training dataset is repeatedly partitioned into training 
 and testing sets by leaving a single observation out,
@@ -1430,14 +1372,14 @@ if do_loo:
     }
     compare_tbl = az.compare(compare_dict)
     print(
-      compare_tbl.to_latex(index=True)
+      compare_tbl.to_latex(index=True, float_format="{:0.2f}".format)
     )
     
 @
 \end{table}
 
 
-\subsection{Calibration}
+\subsection{Probability calibration}
 Another important real-world justification for any probabilistic model,
 be it binary or otherwise is its ability to generate probability predictions
 that match the observed frequency (or rate) of the outcomes under study. In
@@ -1994,6 +1936,70 @@ term on the right-hand side.
 As a final iteration on the basic model, we have an originator-specific
 ``frailty'' term that multiplies the hazard for each observation, scaling
 it up or down. This is the $\gamma$ term in the hierarchical model illustration.
+
+\subsection{Priors}
+A combination of ``generic weakly informative priors'' (to use the language
+employed in the 
+\href{https://github.com/stan-dev/stan/wiki/Prior-Choice-Recommendations}{STAN Wiki})
+and domain knowledge guided our choice of priors for both models. In particular, 
+different values of the variance priors generated very different shapes for the prior-predictive
+distribution of the outcome variable. Our knowledge about processing
+capacity for deferment requests at the servicers allowed us to think
+of thresholds above which the predictive distribution tail values did
+not make sense.   
+
+\begin{figure}
+\caption{Prior Predictive Distributions}
+\label{fig:prior_predictive_dist}
+<<prior_predictive_dist, echo=False >>=
+fig, ax = plt.subplots(1, 2, figsize=(10, 5), sharex=True)
+
+pooled_prior = pm.sample_prior_predictive(model=out_dict["pooled"]["model"], random_seed=12345)
+sns.distplot([x.mean() for x in pooled_prior["yobs"].mean(axis=1)], ax=ax[0], label="Pooled")
+
+hier_prior = pm.sample_prior_predictive(model=out_dict["hier"]["model"], random_seed=12345)
+sns.distplot([x for x in hier_prior["yobs"].mean(axis=1)], ax=ax[1], label="Hierarchical")
+for i in ax:
+    i.set_xlabel("Poisson λ")
+    i.set_ylabel("Frequency")
+    i.axvline(
+        out_dict["pooled"]["s_3_df"][dep_var].mean(), color="tab:red", 
+        label="Sample μ"
+    )
+    i.axvline(
+        np.array([x.mean() for x in (hier_prior["yobs"].mean(axis=1))]).mean(), 
+        color="tab:blue", label="Prior μ"
+    )
+    i.legend()
+@
+\end{figure}
+
+\begin{comment}
+The final model specifications are presented in Tables~\ref{tbl:pooled_model_latex} 
+and~\ref{tbl:hier_model_latex}.
+
+\begin{table}
+\centering
+\caption{Pooled Model}
+\label{tbl:pooled_model_latex}
+\scalebox{0.8}{
+<<pooled_model_latex, echo=False, results="tex">>=
+print(out_dict["pooled"]["model"].__latex__())
+@
+}
+\end{table}
+
+\begin{table}
+\centering
+\caption{Hierarchical Model}
+\label{tbl:hier_model_latex}
+\scalebox{0.8}{
+<<hier_model_latex, echo=False, results="tex">>=
+print(out_dict["hier"]["model"].__latex__())
+@
+}
+\end{table}
+\end{comment}
 
 \bibliographystyle{plainnat}
 \bibliography{corona}
