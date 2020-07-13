@@ -85,7 +85,7 @@ data_dir = base_dir + "data/"
 
 idx = pd.IndexSlice
 
-ASOF_DATE = datetime.date(2020, 7, 2)
+ASOF_DATE = datetime.date(2020, 7, 12)
 dep_var = "defer"
 
 fname = data_dir + "claims.pkl"
@@ -165,27 +165,6 @@ loan portfolios.
 out_dict = {}
 for i in ["pooled", "hier"]:
     out_dict[i] = read_results(i, None, ASOF_DATE, results_dir["ALL"])
-
-def make_ppc_plot(ppc, out_df):
-    ''' make ppc plot '''
-    
-    fig = plt.figure(figsize=(10, 5))
-    ax = fig.gca()
-
-    ax.hist(ppc.mean(axis=0), bins=19, alpha=0.5)
-    ax.axvline(out_df[dep_var].mean())
-    ax.set(xlabel='Hazard.', ylabel='Frequency')
-    ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
-    pctile = np.percentile(ppc.mean(axis=0), q=[5, 95])
-    ax.axvline(pctile[0], color="red", linestyle=":")
-    ax.axvline(pctile[1], color="red", linestyle=":")
-
-    _ = ax.text(
-      1.65 * out_df[dep_var].mean(), 0.85 * ax.get_ylim()[1], 
-      f'95% HPD: [{pctile[0]:.3f}, {pctile[1]:.3f}]'
-    )
-
-    return fig
 @
 
 <<datasets, echo=False>>=
@@ -920,7 +899,12 @@ unconditional probabilities.
 \label{fig:pooled_ppc}
 \scalebox{1}{
 <<pooled_ppc, echo=False>>=
-fig = make_ppc_plot(pooled_ppc, pooled_out_df)
+pooled_train_ppc, pooled_train_df =  predict(
+    None, out_dict["hier"]["train"], dep_var, 
+    out_dict["hier"], ic_long_df=None,
+    n_samples=1000, verbose=False
+)
+fig = make_ppc_plot(pooled_train_ppc, pooled_train_df, dep_var)
 fig.show()
 @
 }
@@ -1041,7 +1025,12 @@ observed outcome variable.
 \label{fig:hier_ppc}
 \scalebox{1}{
 <<hier_ppc, echo=False>>=
-fig = make_ppc_plot(hier_ppc, hier_out_df)
+hier_train_ppc, hier_train_df =  predict(
+    None, out_dict["hier"]["train"], dep_var, 
+    out_dict["hier"], ic_long_df=None,
+    n_samples=1000, verbose=False
+)
+fig = make_ppc_plot(hier_train_ppc, hier_train_df, dep_var)
 fig.show()
 @
 }
@@ -1370,7 +1359,7 @@ if do_loo:
       "hierarchical": hier_result.az_data, 
       "pooled": pooled_result.az_data
     }
-    compare_tbl = az.compare(compare_dict)
+    compare_tbl = az.compare(compare_dict, ic="loo")
     print(
       compare_tbl.to_latex(index=True, float_format="{:0.2f}".format)
     )
@@ -1390,7 +1379,18 @@ rates observed. This is what is depicted in Figure~\ref{fig:prob_calib_ici}.
 The framework used is laid out in \cite{austin_harrell_klaveren}. 
 Each (x, y) point in the figure represents a mapping between the 
 predicted probability of the outcome at $t_{0}$ versus the 
-smoothed observed frequency of the outcome. 
+smoothed observed frequency of the outcome. An unresolved aspect
+of this framework being applied in a Bayesian context (at least 
+in my mind) is the interaction between the ``shrinkage'' inherent
+in a mixed-model framewrk where cluster means are shrunk towards
+the grand mean depending on the strength of the data, and the 
+requirement of fealty to the empirical estimates --- the 2
+approaches seem to be working at cross-purposes. We cannot
+resolve this here and leave this as a topic for future research.
+\textbf{Regardless, both PSIS-LOO and the ICI comparisons seem
+to provide a definitive thumbs-up for the hierarchical model,
+especially given that the comparison was performed using an 
+out-of-sample dataset in the latter exercise.}
 
 <<calibration, echo=False>>=
 n_samples = 4000
