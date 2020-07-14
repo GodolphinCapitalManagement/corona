@@ -659,7 +659,7 @@ In Figures~\ref{fig:lc_defer_hazard_by_state} and
 relationship between payment deferment and the claims measure.
 The solid trend line is a robust fit for the scatter plot 
 depicted here. The patterns appear to show a relatively small 
-relationship (and possibly opposite in effect across the 2 originators)
+relationship (and possibly opposite effects across the 2 originators)
 --- in both cases, there is considerable variation across states.
 
 <<defer_hazard_by_state, echo=False>>=
@@ -1387,7 +1387,7 @@ the grand mean depending on the strength of the data, and the
 requirement of fealty to the empirical estimates --- the 2
 approaches seem to be working at cross-purposes. We cannot
 resolve this here and leave this as a topic for future research.
-\textbf{Regardless, both PSIS-LOO and the ICI comparisons seem
+\textbf{Regardless, both PSIS-LOO and ICI comparisons seem
 to provide a definitive thumbs-up for the hierarchical model,
 especially given that the comparison was performed using an 
 out-of-sample dataset in the latter exercise.}
@@ -1541,12 +1541,17 @@ originators.
 
 Our goals in this report were two-fold. First, we wanted to set out a
 rigorous and transparent statistical framework for analyzing and
-forecasting deferment rates due to the COVID shock to the economy. 
-While the data in the study are from
+forecasting deferment rates due to the COVID shock to the economy
+using (i) the machinery of survival analysis to properly account for
+censored deferment times, and (ii) bayesian estimation to account
+for state-specific differentials in labor market impacts on deferment
+rates. While the data in the study are from
 the consumer loan sector, the framework established here has
-general applicability to a much broader range of assets. Second,
+general applicability to a much broader range of assets. 
+
+Second,
 we wanted to establish quantitative bounds around what we should
-expect for deferment rates over the next quarter. An important
+expect for deferment rates in the future. An important
 derivative work to this report is the development of a cashflow
 engine and valuation model to incorporate these assessments into
 loan pricing. A key element of that analysis will be a
